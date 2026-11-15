@@ -1,0 +1,14 @@
+// The runtime as naru-dev runs it under workerd (src/dev.ts): only bundled by
+// wrangler (dev/scripts/build-worker.mjs), never deployed.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "naru-runtime-dev",
+  "main": "src/dev.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "alias": { "acorn": "./node_modules/acorn/dist/acorn.mjs" },
+  "durable_objects": {
+    "bindings": [{ "name": "SITES", "class_name": "SiteData" }],
+  },
+  "workers_dev": false,
+}

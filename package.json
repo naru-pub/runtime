@@ -1,0 +1,33 @@
+{
+  "name": "naru-runtime",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p sdk",
+    "sdk:build": "node sdk/scripts/emit.mjs",
+    "sdk:check": "node sdk/scripts/emit.mjs --check",
+    "meter:quickjs": "cargo run --quiet --release --locked --manifest-path quickjs/meter/Cargo.toml -- node_modules/@jitl/quickjs-ng-wasmfile-release-sync/dist/emscripten-module.wasm quickjs/metered.wasm",
+    "check:meter": "cargo run --quiet --release --locked --manifest-path quickjs/meter/Cargo.toml -- node_modules/@jitl/quickjs-ng-wasmfile-release-sync/dist/emscripten-module.wasm quickjs/metered.check.wasm && cmp quickjs/metered.wasm quickjs/metered.check.wasm && rm quickjs/metered.check.wasm",
+    "test:sdk": "node --test \"sdk/spec/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261008.1",
+    "@types/node": "^26.6.4",
+    "prettier": "3.9.10",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.3",
+    "workerd": "1.20261006.1",
+    "wrangler": "^4.148.0"
+  },
+  "dependencies": {
+    "@jitl/quickjs-ng-wasmfile-release-sync": "0.32.0",
+    "acorn": "^8.19.0",
+    "quickjs-emscripten-core": "0.32.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "undici@7": "^7.30.1"
+    }
+  }
+}

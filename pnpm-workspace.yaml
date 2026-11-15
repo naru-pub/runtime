@@ -1,0 +1,15 @@
+# The runtime is its own one-package workspace; sdk/ and dev/ are packages of
+# their own, installed apart.
+packages:
+  - "."
+allowBuilds:
+  esbuild: true
+  workerd: true
+onlyBuiltDependencies:
+  - esbuild
+  - workerd
+# Miniflare's HTTP client, past advisories, within its major version.
+# Also in package.json, the same: pnpm 9 reads it only there and refuses the
+# lockfile otherwise; pnpm 11 and later read it only here.
+overrides:
+  "undici@7": "^7.30.1"

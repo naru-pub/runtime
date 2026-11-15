@@ -1,0 +1,87 @@
+// functions.d.ts is written by hand: site code checks against it.
+import type {
+  ErrorCode,
+  Json,
+  Mutation,
+  MutationCtx,
+  Query,
+  QueryCtx,
+  Route,
+  RouteAnswer,
+} from "../files/1.1.0/functions.js";
+import type * as Sdk from "../files/1.1.0/naru.js";
+
+type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+const sameJson: Same<Json, Sdk.Json> = true;
+const sameCodes: Same<ErrorCode, Sdk.NaruErrorCode> = true;
+
+// A query reads the site's tables; it has no collections.
+export const posts: Query<{ board: string }, { id: number }[]> = async (
+  ctx,
+  { board },
+) => {
+  // @ts-expect-error Queries reach tables through sql only.
+  await ctx.get("posts", "1");
+  // @ts-expect-error Roles are the site's own, in its tables.
+  await ctx.rolesOf(["m-1"]);
+  // @ts-expect-error Only a mutation notifies.
+  await ctx.notify(["m-1"], { title: "t" });
+  // @ts-expect-error Only a mutation hashes passwords.
+  await ctx.passwords.hash("pw");
+  const { rows } = await ctx.sql<{
+    id: number;
+  }>`SELECT id FROM posts WHERE board = ${board}`;
+  return rows;
+};
+export const write: Mutation<{ title: string }, number> = async (
+  ctx,
+  { title },
+) => {
+  // @ts-expect-error A visitor is neither ctx.member nor ctx.owner.
+  void ctx.visitor;
+  if (!ctx.member) return ctx.fail("AUTH_REQUIRED", "로그인해 주세요.");
+  // @ts-expect-error Roles are the site's own, in its tables.
+  void ctx.member.roles;
+  const hash: string = await ctx.passwords.hash(title);
+  await ctx.notify([ctx.member.id], { title: "새 글", path: "/posts/1" });
+  // @ts-expect-error A notification has a title, and members come as a list.
+  await ctx.notify(ctx.member.id, { body: "x" });
+  return (
+    await ctx.sql("INSERT INTO posts (title, hash) VALUES (?, ?)", [
+      title,
+      hash,
+    ])
+  ).changes;
+};
+// ctx typed where it is declared, so ctx.fail (never) narrows what follows.
+export async function check(ctx: QueryCtx, { id }: { id: number }) {
+  const { rows } = await ctx.sql<{
+    hash: string | null;
+  }>`SELECT hash FROM posts WHERE id = ${id}`;
+  if (!rows[0]?.hash) ctx.fail("NOT_FOUND", "없는 글입니다.");
+  return ctx.passwords.verify("pw", rows[0].hash, `post:${id}`);
+}
+const asMutation: MutationCtx extends QueryCtx ? true : false = true;
+
+// A route reads as a query does, and answers each way the edge accepts.
+export const route: Route = async (
+  ctx,
+  { path, origin, query },
+): Promise<RouteAnswer> => {
+  // @ts-expect-error Only a mutation notifies.
+  await ctx.notify(["m-1"], { title: "t" });
+  if (path === "/") return "<p>home</p>";
+  if (path === "/feed.xml")
+    return { body: "<rss/>", type: "application/rss+xml", cache: 60 };
+  if (path === "/old") return { redirect: "/new", status: 301 };
+  // @ts-expect-error A body says its type.
+  if (path === "/bad") return { body: "x" };
+  // @ts-expect-error Only these types are served.
+  if (path === "/js") return { body: "x", type: "text/javascript" };
+  return {
+    file: "post.html",
+    head: `<meta property="og:url" content="${origin}${path}${query.q ?? ""}">`,
+  };
+};
+
+export const checks = { sameJson, sameCodes, asMutation };
