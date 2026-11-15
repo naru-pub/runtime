@@ -90,7 +90,7 @@ try {
   assert.match(
     naru.log(),
     new RegExp(
-      `@naru-pub/dev ${version.replaceAll(".", "\\.")} \\(naru-pub [0-9a-f]+(-dirty)?\\), SDK 1\\.0\\.0, 1\\.1\\.0`,
+      `@naru-pub/dev ${version.replaceAll(".", "\\.")} \\(runtime [0-9a-f]+(-dirty)?\\), SDK 1\\.0\\.0, 1\\.1\\.0`,
     ),
   );
   const { origin } = naru;
