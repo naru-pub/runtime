@@ -2048,8 +2048,9 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     const engine = await quickjs();
     const tables: SqlTables = { read: new Set(), written: new Set() };
     try {
-      const counted =
-        input.live !== "refresh" && (visitor || input.member !== null);
+      // A live refresh is metered too, though never refused: the write that
+      // caused it was admitted, and the rows are still the site's.
+      const counted = visitor || input.member !== null;
       const outcome = this.run(() => ({
         result: (counted
           ? <T>(work: () => T) => this.metered(work)
