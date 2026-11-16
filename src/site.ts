@@ -1431,8 +1431,10 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     const rows: Record<string, SqlValue>[] = [];
     let bytes = 0;
     let cursor: SqlStorageCursor<Record<string, SqlStorageValue>>;
+    let read: { rowsRead: number } | undefined;
     try {
       cursor = this.sql.exec(text, ...bound);
+      read = cursor;
       for (const raw of cursor) {
         // A BLOB crosses into the sandbox as { $blob: base64 }, which ctx.sql
         // hands the code as a Uint8Array (functions.ts).
@@ -1471,6 +1473,10 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           text: text.slice(0, TRIP_TEXT_CHARS),
         });
       throw sqlFailure(error, statementBudget(this.env));
+    } finally {
+      // Into the site's rows: a member's or visitor's call is metered
+      // (rows per minute, and the month's `rows`), failed statements too.
+      this.rowsRead += read?.rowsRead ?? 0;
     }
     // A call reads a bounded number of rows, all its statements together.
     budget.rowsRead += cursor.rowsRead;
