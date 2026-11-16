@@ -526,9 +526,9 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   /**
    * Runs a live query as `me`: a subscription's first run is a query call
    * like any other, counted and limited; a re-run after a write is the
-   * site's doing and only metered. Answers what it returned, the tables it
-   * read (["*"] when it read a view, which could be any), and a hash of the
-   * answer to tell whether it changed.
+   * site's doing: metered and counted, never limited. Answers what it
+   * returned, the tables it read (["*"] when it read a view, which could be
+   * any), and a hash of the answer to tell whether it changed.
    */
   private async liveRun(
     me: LiveSocket,
@@ -633,7 +633,6 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       const me = socket?.deserializeAttachment() as LiveSocket | null;
       if (!me) continue;
       const [file, fn] = String(first.query).split(":");
-      this.tally("live_refresh");
       const outcome = await this.liveRun(
         me,
         file,
@@ -2024,7 +2023,12 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     }
     const admitted = this.run(() => {
       this.claim(input.ownerId);
-      if (input.live === "refresh") return;
+      // A live refresh is the site's doing, so it is never limited per
+      // caller, but a member's or visitor's spends the month's budget.
+      if (input.live === "refresh") {
+        if (visitor || input.member !== null) this.spend("live_refresh");
+        return;
+      }
       if (visitor || input.member !== null) this.admitWork();
       // A query or a route's page replaces a page's reads, so it is limited
       // as reads are: 600 a minute per member or address.
@@ -2048,8 +2052,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     const engine = await quickjs();
     const tables: SqlTables = { read: new Set(), written: new Set() };
     try {
-      // A live refresh is metered too, though never refused: the write that
-      // caused it was admitted, and the rows are still the site's.
+      // A live refresh is metered too, though never refused for its rows:
+      // the write that caused it was admitted.
       const counted = visitor || input.member !== null;
       const outcome = this.run(() => ({
         result: (counted
