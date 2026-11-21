@@ -31,6 +31,22 @@ Outside a page on `<site>.naru.pub`, say which site:
 `createNaru({ site: "demo" })`. Node needs version 22 or later for live
 queries (its built-in WebSocket).
 
+## Builder handoff
+
+From 1.2.0, `handoff.js` (`@naru-pub/sdk/handoff`) is for websites that make
+someone's Naru site, builders: `propose({ title, target, files })` hands the
+files to Naru, where the site's owner sees what would change and approves,
+and resolves `{ applied: true, url }` or `{ applied: false }`. On the web it
+opens Naru in a popup, so call it from a click; in the Naru apps it hands the
+files to the app. `photo(file)` resizes a picked photo to 1600 pixels on the
+long side and re-encodes it, which drops its metadata, location included.
+
+```html
+<script type="module">
+  import { propose, photo } from "https://sdk.naru.pub/sdk/1.2.0/handoff.js";
+</script>
+```
+
 ## Bundled or loaded from Naru
 
 Bundled, a site keeps the SDK it was built with until it is built again.

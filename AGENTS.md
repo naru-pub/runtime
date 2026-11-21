@@ -13,7 +13,8 @@ plane calls: land it here first, then bump the submodule there.
 
 ## SDK
 
-`sdk/source/<version>/naru.ts` is the source; `sdk/files/<version>/` is what
-it emits and what Naru serves. Run `pnpm sdk:build` after editing a version
+`sdk/source/<version>/naru.ts` (and from 1.2.0 `handoff.ts`, the builder
+handoff) is the source; `sdk/files/<version>/` is what it emits and what Naru
+serves. Run `pnpm sdk:build` after editing a version
 still in `sdk/scripts/emit.mjs`'s `VERSIONS`, and commit both. A frozen
 version's files are checked byte for byte (`sdk/spec/frozen-sdk.test.mjs`).

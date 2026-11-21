@@ -27,6 +27,10 @@
     "./functions": {
       "types": "./dist/functions.d.ts"
     },
+    "./handoff": {
+      "types": "./dist/handoff.d.ts",
+      "default": "./dist/handoff.js"
+    },
     "./package.json": "./package.json"
   },
   "types": "./dist/naru.d.ts",

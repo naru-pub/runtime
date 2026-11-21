@@ -19,7 +19,19 @@ assert.equal(typeof sdk.NaruError, "function");
 assert.throws(() => sdk.createNaru(), TypeError, "no site outside a page");
 assert.equal(typeof sdk.createNaru({ site: "demo" }).query, "function");
 
-for (const types of [exports["."].types, exports["./functions"].types]) {
+// The builder handoff, from 1.2.0.
+if (exports["./handoff"]) {
+  const handoff = await import("@naru-pub/sdk/handoff");
+  assert.equal(typeof handoff.propose, "function");
+  assert.equal(typeof handoff.photo, "function");
+  await assert.rejects(handoff.propose({ files: [] }), TypeError);
+}
+
+for (const types of [
+  exports["."].types,
+  exports["./functions"].types,
+  exports["./handoff"]?.types,
+].filter(Boolean)) {
   const text = await readFile(join(root, types), "utf8");
   assert.match(text, /@packageDocumentation/, types);
 }

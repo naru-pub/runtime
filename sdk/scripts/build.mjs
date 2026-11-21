@@ -1,5 +1,5 @@
 // Builds the package into dist/ from the SDK Naru serves: one SDK version's
-// naru.js, naru.d.ts and functions.d.ts from files/<version>/, copied
+// naru.js, naru.d.ts, functions.d.ts and handoff.js/.d.ts from files/<version>/, copied
 // unchanged, so the package is byte for byte what
 // https://sdk.naru.pub/sdk/<version>/ serves. And LICENSE, the repository's.
 //
@@ -36,11 +36,17 @@ if (!unfrozen && prerelease)
 const source = join(root, "files", sdk);
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist);
-for (const name of ["naru.js", "naru.d.ts", "functions.d.ts"]) {
-  // 1.0.0 has no functions.d.ts.
+for (const name of [
+  "naru.js",
+  "naru.d.ts",
+  "functions.d.ts",
+  "handoff.js",
+  "handoff.d.ts",
+]) {
+  // 1.0.0 has no functions.d.ts, and the builder handoff is 1.2.0's.
   if (existsSync(join(source, name)))
     await cp(join(source, name), join(dist, name));
-  else if (name !== "functions.d.ts")
+  else if (!["functions.d.ts", "handoff.js", "handoff.d.ts"].includes(name))
     throw new Error(`${join(source, name)} is missing`);
 }
 await cp(join(repo, "LICENSE"), join(root, "LICENSE"));

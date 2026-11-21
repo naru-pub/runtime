@@ -1,7 +1,8 @@
 import aliases from "../sdk/aliases.json";
 
-// The Data SDK, sdk.naru.pub/sdk/<version>/naru.js, naru.d.ts and (1.1.0)
-// functions.d.ts, answered by workerd beside the data API, on Naru's servers
+// The Data SDK, sdk.naru.pub/sdk/<version>/naru.js, naru.d.ts, (1.1.0)
+// functions.d.ts and (1.2.0) the builder handoff, handoff.js and handoff.d.ts,
+// answered by workerd beside the data API, on Naru's servers
 // and in naru-dev. The files are the committed sdk/files/, copied beside the
 // Worker as workerd's sdk-files service (workerd-config.mjs); /sdk/1/ names
 // the newest 1.x release as configured in sdk/aliases.json.
@@ -15,10 +16,12 @@ const VERSION = /^\d+\.\d+\.\d+$/;
 export const SDK_CACHE = "public, max-age=300, stale-while-revalidate=86400";
 const CONTENT_TYPES: Record<string, string> = {
   "naru.js": "text/javascript; charset=utf-8",
+  "handoff.js": "text/javascript; charset=utf-8",
   // Declarations are text an editor or a person reads: the SDK's, and from
   // 1.1.0 what site functions and collection rules are handed.
   "naru.d.ts": "text/plain; charset=utf-8",
   "functions.d.ts": "text/plain; charset=utf-8",
+  "handoff.d.ts": "text/plain; charset=utf-8",
 };
 
 const ALIASES: Record<string, string> = aliases;

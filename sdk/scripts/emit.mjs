@@ -1,5 +1,6 @@
-// Emits each SDK version's naru.js and naru.d.ts into files/<version>/ from
-// source/<version>/naru.ts. Run `pnpm sdk:build` (in the repository root)
+// Emits each SDK version's modules into files/<version>/ from
+// source/<version>/: naru.ts as naru.js and naru.d.ts, and from 1.2.0
+// handoff.ts (the builder handoff) as handoff.js and handoff.d.ts. Run `pnpm sdk:build` (in the repository root)
 // after editing the source and commit what it writes; `pnpm sdk:check` fails
 // instead of writing when the committed files are not what the source emits
 // now.
@@ -9,6 +10,7 @@
 // at deploy time, so a compiler or formatter upgrade can change them only in a
 // commit that shows the change. A version that has been frozen is removed from
 // VERSIONS below rather than re-emitted.
+import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -108,11 +110,13 @@ async function readable(name, text, source) {
 }
 
 let stale = false;
-for (const version of VERSIONS) {
-  const source = join(root, "source", version, "naru.ts");
+for (const version of VERSIONS)
+for (const module of ["naru", "handoff"]) {
+  const source = join(root, "source", version, `${module}.ts`);
+  if (module !== "naru" && !existsSync(source)) continue;
   const emitted = emit(source);
   const parsed = parse(source, await readFile(source, "utf8"));
-  for (const name of ["naru.js", "naru.d.ts"]) {
+  for (const name of [`${module}.js`, `${module}.d.ts`]) {
     const output = join(root, "files", version, name);
     const text = emitted.get(name);
     if (text === undefined) throw new Error(`No ${name} was emitted.`);
@@ -125,7 +129,7 @@ for (const version of VERSIONS) {
     }
     if (check) {
       stale = true;
-      console.error(`${path} is not what source/${version}/naru.ts emits.`);
+      console.error(`${path} is not what source/${version}/${module}.ts emits.`);
       continue;
     }
     await writeFile(output, contents);

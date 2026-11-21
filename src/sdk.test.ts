@@ -24,6 +24,7 @@ const files = env({
   "/1.1.0/naru.js": "export const createNaru = 1;",
   "/1.1.0/naru.d.ts": "export declare const createNaru: number;",
   "/1.1.0/functions.d.ts": "export interface Ctx {}",
+  "/1.2.0/handoff.js": "export const propose = 2;",
 });
 const get = (path: string, init?: RequestInit) =>
   serveSdk(new Request(`https://naru.pub${path}`, init), files);
@@ -75,6 +76,16 @@ describe("serving", () => {
     }
     // 1.0.0 has no functions to describe.
     expect((await get("/sdk/1.0.0/functions.d.ts")).status).toBe(404);
+  });
+
+  test("serves the builder handoff from 1.2.0", async () => {
+    const response = await get("/sdk/1.2.0/handoff.js");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe(
+      "text/javascript; charset=utf-8",
+    );
+    // Earlier releases have none.
+    expect((await get("/sdk/1.1.0/handoff.js")).status).toBe(404);
   });
 
   test("answers a revalidation with 304", async () => {
