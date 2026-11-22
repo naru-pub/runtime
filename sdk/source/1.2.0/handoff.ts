@@ -64,9 +64,10 @@ export interface Proposal {
    * The collections its pages use, by name, such as
    * `{ guestbook: { read: "world", write: "create" } }`. Naru merges them
    * into the site's `_naru/collections.json`, shows the owner what they
-   * create or change, and applies them with the files. A collection this
-   * builder declared before and leaves out is taken out of the file, never
-   * deleted with its documents.
+   * create or change, and applies them with the files. Left out, the site's
+   * collections stay as they are; a collection this builder declared before
+   * and leaves out of an object it sends (`{}` for all) is taken out of the
+   * file, never deleted with its documents.
    */
   collections?: Record<string, CollectionSettings>;
   files: ProposedFile[];
