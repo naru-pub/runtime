@@ -93,6 +93,7 @@ async function viaApp(bridge, proposal) {
     builder: proposal.builder,
     title: proposal.title,
     target: proposal.target,
+    collections: proposal.collections,
     files,
   });
 }
@@ -126,6 +127,7 @@ function viaPopup(proposal) {
             builder: proposal.builder,
             title: proposal.title,
             target: proposal.target,
+            collections: proposal.collections,
             files: proposal.files,
           },
           CONTROL_PLANE,

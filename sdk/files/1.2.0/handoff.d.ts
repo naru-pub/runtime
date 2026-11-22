@@ -33,6 +33,21 @@ export interface ProposedFile {
   data: string | Blob | ArrayBuffer | ArrayBufferView;
 }
 
+/**
+ * A Naru Data collection the builder's pages use, as the site's
+ * `_naru/collections.json` declares one.
+ */
+export interface CollectionSettings {
+  /** Who can read its documents: the owner only, or anyone. */
+  read: "admin" | "world";
+  /** Who can write: the owner only, anyone adding new documents, or anyone. */
+  write: "admin" | "create" | "world";
+  /** Up to three fields no two documents may share. */
+  unique?: string[];
+  /** Up to five fields reads filter on often, each given an index. */
+  indexes?: string[];
+}
+
 export interface Proposal {
   /**
    * Which builder this is, when one website holds several, such as
@@ -45,6 +60,15 @@ export interface Proposal {
   title?: string;
   /** A folder of the owner's site to put the files in, such as `"blog/"`; the site's root if left out. */
   target?: string;
+  /**
+   * The collections its pages use, by name, such as
+   * `{ guestbook: { read: "world", write: "create" } }`. Naru merges them
+   * into the site's `_naru/collections.json`, shows the owner what they
+   * create or change, and applies them with the files. A collection this
+   * builder declared before and leaves out is taken out of the file, never
+   * deleted with its documents.
+   */
+  collections?: Record<string, CollectionSettings>;
   files: ProposedFile[];
 }
 
