@@ -34,12 +34,14 @@ queries (its built-in WebSocket).
 ## Builder handoff
 
 From 1.2.0, `handoff.js` (`@naru-pub/sdk/handoff`) is for websites that make
-someone's Naru site, builders: `propose({ title, target, files })` hands the
+someone's Naru site, builders: `propose({ builder, title, target, files })` hands the
 files to Naru, where the site's owner sees what would change and approves,
 and resolves `{ applied: true, url }` or `{ applied: false }`. On the web it
 opens Naru in a popup, so call it from a click; in the Naru apps it hands the
 files to the app. `photo(file)` resizes a picked photo to 1600 pixels on the
 long side and re-encodes it, which drops its metadata, location included.
+`builder` names the builder when one website holds several, so each
+replaces only what it wrote itself.
 
 ```html
 <script type="module">

@@ -8,6 +8,7 @@
  *
  * button.onclick = async () => {
  *   const result = await propose({
+ *     builder: "homepage",
  *     title: "내 홈페이지",
  *     files: [{ path: "index.html", data: html }, { path: "photo.jpg", data: blob }],
  *   });
@@ -33,6 +34,13 @@ export interface ProposedFile {
 }
 
 export interface Proposal {
+  /**
+   * Which builder this is, when one website holds several, such as
+   * `"profile"`: lowercase letters, digits and single hyphens, up to 40.
+   * Naru tells builders apart by their origin and this name, so one builder
+   * replaces only what it wrote itself, and keeps a copy of the rest.
+   */
+  builder?: string;
   /** What the owner sees it as, such as `"소개 페이지"`. */
   title?: string;
   /** A folder of the owner's site to put the files in, such as `"blog/"`; the site's root if left out. */

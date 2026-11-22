@@ -8,6 +8,7 @@
  *
  * button.onclick = async () => {
  *   const result = await propose({
+ *     builder: "homepage",
  *     title: "내 홈페이지",
  *     files: [{ path: "index.html", data: html }, { path: "photo.jpg", data: blob }],
  *   });
@@ -89,6 +90,7 @@ async function viaApp(bridge, proposal) {
   );
   return bridge({
     id: crypto.randomUUID(),
+    builder: proposal.builder,
     title: proposal.title,
     target: proposal.target,
     files,
@@ -121,6 +123,7 @@ function viaPopup(proposal) {
         popup.postMessage(
           {
             type: "naru:files",
+            builder: proposal.builder,
             title: proposal.title,
             target: proposal.target,
             files: proposal.files,
