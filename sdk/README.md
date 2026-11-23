@@ -41,8 +41,7 @@ opens Naru in a popup, so call it from a click; in the Naru apps it hands the
 files to the app. `photo(file)` resizes a picked photo to 1600 pixels on the
 long side and re-encodes it, which drops its metadata, location included.
 `maker` names the maker when one website holds several, so each
-replaces only what it wrote itself. (`builder`, its former name, still
-works.)
+replaces only what it wrote itself.
 `collections` names the Naru Data collections the pages use, as
 `_naru/collections.json` declares them; Naru merges them into the site's
 declaration and the owner approves them with the files.

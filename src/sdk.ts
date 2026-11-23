@@ -1,7 +1,7 @@
 import aliases from "../sdk/aliases.json";
 
 // The Data SDK, sdk.naru.pub/sdk/<version>/naru.js, naru.d.ts, (1.1.0)
-// functions.d.ts and (1.2.0) the builder handoff, handoff.js and handoff.d.ts,
+// functions.d.ts and (1.2.0) the maker handoff, handoff.js and handoff.d.ts,
 // answered by workerd beside the data API, on Naru's servers
 // and in naru-dev. The files are the committed sdk/files/, copied beside the
 // Worker as workerd's sdk-files service (workerd-config.mjs); /sdk/1/ names

@@ -373,7 +373,7 @@ globalThis.__run = async (name, member, owner, now, args, kind, ownerName) => {
     return decoded;
   };
   // ctx.sql\`SELECT ... WHERE id = \${id}\` binds each value as a parameter;
-  // ctx.sql(text, values) takes a builder's compiled statement.
+  // ctx.sql(text, values) takes a query builder's compiled statement.
   const ctx = Object.freeze({
     member: who,
     owner,

@@ -78,7 +78,7 @@ describe("serving", () => {
     expect((await get("/sdk/1.0.0/functions.d.ts")).status).toBe(404);
   });
 
-  test("serves the builder handoff from 1.2.0", async () => {
+  test("serves the maker handoff from 1.2.0", async () => {
     const response = await get("/sdk/1.2.0/handoff.js");
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe(

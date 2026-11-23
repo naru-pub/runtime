@@ -56,8 +56,6 @@ export interface Proposal {
    * replaces only what it wrote itself, and keeps a copy of the rest.
    */
   maker?: string;
-  /** @deprecated `maker`'s former name, read when `maker` is left out. */
-  builder?: string;
   /** What the owner sees it as, such as `"소개 페이지"`. */
   title?: string;
   /** A folder of the owner's site to put the files in, such as `"blog/"`; the site's root if left out. */
@@ -166,7 +164,7 @@ async function viaApp(bridge: Bridge, proposal: Proposal) {
   );
   return bridge({
     id: crypto.randomUUID(),
-    maker: proposal.maker ?? proposal.builder,
+    maker: proposal.maker,
     title: proposal.title,
     target: proposal.target,
     collections: proposal.collections,
@@ -200,7 +198,7 @@ function viaPopup(proposal: Proposal) {
         popup!.postMessage(
           {
             type: "naru:files",
-            maker: proposal.maker ?? proposal.builder,
+            maker: proposal.maker,
             title: proposal.title,
             target: proposal.target,
             collections: proposal.collections,

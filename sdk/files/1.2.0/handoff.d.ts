@@ -56,8 +56,6 @@ export interface Proposal {
    * replaces only what it wrote itself, and keeps a copy of the rest.
    */
   maker?: string;
-  /** @deprecated `maker`'s former name, read when `maker` is left out. */
-  builder?: string;
   /** What the owner sees it as, such as `"소개 페이지"`. */
   title?: string;
   /** A folder of the owner's site to put the files in, such as `"blog/"`; the site's root if left out. */

@@ -90,7 +90,7 @@ async function viaApp(bridge, proposal) {
   );
   return bridge({
     id: crypto.randomUUID(),
-    maker: proposal.maker ?? proposal.builder,
+    maker: proposal.maker,
     title: proposal.title,
     target: proposal.target,
     collections: proposal.collections,
@@ -124,7 +124,7 @@ function viaPopup(proposal) {
         popup.postMessage(
           {
             type: "naru:files",
-            maker: proposal.maker ?? proposal.builder,
+            maker: proposal.maker,
             title: proposal.title,
             target: proposal.target,
             collections: proposal.collections,
