@@ -1,6 +1,6 @@
 // Emits each SDK version's modules into files/<version>/ from
 // source/<version>/: naru.ts as naru.js and naru.d.ts, and from 1.2.0
-// handoff.ts (the builder handoff) as handoff.js and handoff.d.ts. Run `pnpm sdk:build` (in the repository root)
+// handoff.ts (the maker handoff) as handoff.js and handoff.d.ts. Run `pnpm sdk:build` (in the repository root)
 // after editing the source and commit what it writes; `pnpm sdk:check` fails
 // instead of writing when the committed files are not what the source emits
 // now.

@@ -43,7 +43,7 @@ for (const name of [
   "handoff.js",
   "handoff.d.ts",
 ]) {
-  // 1.0.0 has no functions.d.ts, and the builder handoff is 1.2.0's.
+  // 1.0.0 has no functions.d.ts, and the maker handoff is 1.2.0's.
   if (existsSync(join(source, name)))
     await cp(join(source, name), join(dist, name));
   else if (!["functions.d.ts", "handoff.js", "handoff.d.ts"].includes(name))

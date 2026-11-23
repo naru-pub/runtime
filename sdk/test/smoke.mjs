@@ -19,7 +19,7 @@ assert.equal(typeof sdk.NaruError, "function");
 assert.throws(() => sdk.createNaru(), TypeError, "no site outside a page");
 assert.equal(typeof sdk.createNaru({ site: "demo" }).query, "function");
 
-// The builder handoff, from 1.2.0.
+// The maker handoff, from 1.2.0.
 if (exports["./handoff"]) {
   const handoff = await import("@naru-pub/sdk/handoff");
   assert.equal(typeof handoff.propose, "function");

@@ -1,6 +1,6 @@
 /**
- * Naru's builder handoff: a website that makes someone's Naru site (a
- * builder) hands Naru the files, and the site's owner reviews and approves
+ * Naru's maker handoff: a website that makes someone's Naru site (a
+ * maker) hands Naru the files, and the site's owner reviews and approves
  * them on Naru.
  *
  * ```js
@@ -8,7 +8,7 @@
  *
  * button.onclick = async () => {
  *   const result = await propose({
- *     builder: "homepage",
+ *     maker: "homepage",
  *     title: "내 홈페이지",
  *     files: [{ path: "index.html", data: html }, { path: "photo.jpg", data: blob }],
  *   });
@@ -90,7 +90,7 @@ async function viaApp(bridge, proposal) {
   );
   return bridge({
     id: crypto.randomUUID(),
-    builder: proposal.builder,
+    maker: proposal.maker ?? proposal.builder,
     title: proposal.title,
     target: proposal.target,
     collections: proposal.collections,
@@ -124,7 +124,7 @@ function viaPopup(proposal) {
         popup.postMessage(
           {
             type: "naru:files",
-            builder: proposal.builder,
+            maker: proposal.maker ?? proposal.builder,
             title: proposal.title,
             target: proposal.target,
             collections: proposal.collections,

@@ -1,6 +1,6 @@
 /**
- * Naru's builder handoff: a website that makes someone's Naru site (a
- * builder) hands Naru the files, and the site's owner reviews and approves
+ * Naru's maker handoff: a website that makes someone's Naru site (a
+ * maker) hands Naru the files, and the site's owner reviews and approves
  * them on Naru.
  *
  * ```js
@@ -8,7 +8,7 @@
  *
  * button.onclick = async () => {
  *   const result = await propose({
- *     builder: "homepage",
+ *     maker: "homepage",
  *     title: "내 홈페이지",
  *     files: [{ path: "index.html", data: html }, { path: "photo.jpg", data: blob }],
  *   });
@@ -34,7 +34,7 @@ export interface ProposedFile {
 }
 
 /**
- * A Naru Data collection the builder's pages use, as the site's
+ * A Naru Data collection the maker's pages use, as the site's
  * `_naru/collections.json` declares one.
  */
 export interface CollectionSettings {
@@ -50,11 +50,13 @@ export interface CollectionSettings {
 
 export interface Proposal {
   /**
-   * Which builder this is, when one website holds several, such as
+   * Which maker this is, when one website holds several, such as
    * `"profile"`: lowercase letters, digits and single hyphens, up to 40.
-   * Naru tells builders apart by their origin and this name, so one builder
+   * Naru tells makers apart by their origin and this name, so one maker
    * replaces only what it wrote itself, and keeps a copy of the rest.
    */
+  maker?: string;
+  /** @deprecated `maker`'s former name, read when `maker` is left out. */
   builder?: string;
   /** What the owner sees it as, such as `"소개 페이지"`. */
   title?: string;
@@ -65,7 +67,7 @@ export interface Proposal {
    * `{ guestbook: { read: "world", write: "create" } }`. Naru merges them
    * into the site's `_naru/collections.json`, shows the owner what they
    * create or change, and applies them with the files. Left out, the site's
-   * collections stay as they are; a collection this builder declared before
+   * collections stay as they are; a collection this maker declared before
    * and leaves out of an object it sends (`{}` for all) is taken out of the
    * file, never deleted with its documents.
    */
