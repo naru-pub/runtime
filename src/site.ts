@@ -108,6 +108,7 @@ const fromDump = (value: DumpRow[string] | undefined): SqlValue =>
   value && typeof value === "object"
     ? new Uint8Array(Buffer.from(value.$base64, "base64")).buffer
     : (value ?? null);
+import { FLUSH_DELAY_MS, LiveRegistry } from "./live-registry";
 import { MinuteCounts } from "./minute-counts";
 import { hashPassword, verifyPassword } from "./passwords";
 import { quickjs } from "./quickjs";
@@ -403,6 +404,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.createTables();
+    this.loadLive();
     this.resumeNotifications();
     // Keepalives are answered without waking the object.
     ctx.setWebSocketAutoResponse(
@@ -487,12 +489,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     if (!me || typeof id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(id))
       return;
     if (message.type === "unsubscribe") {
-      this.sql.exec(
-        "DELETE FROM _naru_subscriptions WHERE socket = ? AND id = ?",
-        me.id,
-        id,
-      );
-      this.sentHashes.get(me.id)?.delete(id);
+      this.live.unsubscribe(me.id, id);
+      this.flushLiveSoon();
       return;
     }
     if (message.type !== "subscribe") return;
@@ -508,24 +506,16 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     let file: string, fn: string;
     try {
       ({ file, fn } = functionReference(String(message.query)));
-      const existing = this.rows(
-        "SELECT id FROM _naru_subscriptions WHERE socket = ?",
-        me.id,
-      );
       if (
-        existing.length >= MAX_SOCKET_SUBSCRIPTIONS &&
-        !existing.some((row) => row.id === id)
+        this.live.count(me.id) >= MAX_SOCKET_SUBSCRIPTIONS &&
+        !this.live.get(me.id, id)
       )
         throw new DataError(
           429,
           `A connection holds at most ${MAX_SOCKET_SUBSCRIPTIONS} live queries.`,
           "RATE_LIMITED",
         );
-      if (
-        Number(
-          this.rows("SELECT count(*) AS n FROM _naru_subscriptions")[0].n,
-        ) >= MAX_SITE_SUBSCRIPTIONS
-      )
+      if (this.live.count() >= MAX_SITE_SUBSCRIPTIONS)
         throw new DataError(
           503,
           "The site holds as many live queries as it can.",
@@ -541,28 +531,22 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       liveSend(socket, { type: "error", id, error: outcome.error });
       return;
     }
-    this.sql.exec(
-      `INSERT INTO _naru_subscriptions (socket, id, member, query, args, tables, hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (socket, id) DO UPDATE SET query = excluded.query, args = excluded.args,
-         tables = excluded.tables, hash = excluded.hash`,
-      me.id,
-      id,
-      me.member,
-      `${file}:${fn}`,
-      JSON.stringify(args),
-      JSON.stringify(outcome.value.tables),
-      outcome.value.hash,
-    );
-    this.sent(me.id, id, outcome.value.hash);
+    this.live.set(me.id, id, {
+      member: me.member,
+      query: `${file}:${fn}`,
+      args: JSON.stringify(args),
+      tables: JSON.stringify(outcome.value.tables),
+      sent: outcome.value.hash,
+    });
+    this.flushLiveSoon();
     liveSend(socket, { type: "result", id, result: outcome.value.result });
   }
 
   async webSocketClose(socket: WebSocket, code: number) {
     const me = socket.deserializeAttachment() as LiveSocket | null;
     if (me) {
-      this.sql.exec("DELETE FROM _naru_subscriptions WHERE socket = ?", me.id);
-      this.sentHashes.delete(me.id);
+      this.live.close(me.id);
+      this.flushLiveSoon();
     }
     // 1005 (no code) and 1006 (dropped) are only ever received, never sent.
     socket.close(code === 1005 || code === 1006 ? 1000 : code);
@@ -624,20 +608,71 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   }
 
   /**
-   * The hash of the answer each subscription was last sent, by socket and
-   * subscription, in memory. A refresh writes a subscription's row only when
-   * the tables it read change, not each time its answer does: a busy site's
-   * live queries rewrote their rows on every write to what they read. What
-   * the row keeps is what a refresh needs after the object is put away with
-   * its sockets open (hibernation): what it reads, and so which writes re-run
-   * it. A subscription with no hash here (the object started again since)
-   * is sent its answer: at worst one it already has, never one it lacks.
+   * The live queries, in memory, and `_naru_subscriptions` their checkpoint
+   * for hibernation, written with all the changes of FLUSH_DELAY_MS at once
+   * (live-registry.ts says why). The pending timer keeps the object from
+   * being put away before it is written.
    */
-  private sentHashes = new Map<string, Map<string, string>>();
-  private sent(socket: string, id: string, hash: string) {
-    let hashes = this.sentHashes.get(socket);
-    if (!hashes) this.sentHashes.set(socket, (hashes = new Map()));
-    hashes.set(id, hash);
+  private live = new LiveRegistry();
+  private liveFlush?: ReturnType<typeof setTimeout>;
+
+  private loadLive() {
+    this.live.load(
+      this.rows(
+        "SELECT socket, id, member, query, args, tables FROM _naru_subscriptions",
+      ).map((row) => ({
+        socket: String(row.socket),
+        id: String(row.id),
+        member: row.member === null ? null : String(row.member),
+        query: String(row.query),
+        args: String(row.args),
+        tables: String(row.tables),
+        hash: "",
+      })),
+    );
+  }
+
+  private flushLiveSoon() {
+    if (this.liveFlush !== undefined || !this.live.behind) return;
+    this.liveFlush = setTimeout(() => this.flushLive(), FLUSH_DELAY_MS);
+  }
+
+  /** Brings `_naru_subscriptions` up to date with the live queries, at once. */
+  private flushLive() {
+    this.liveFlush = undefined;
+    const changes = this.live.changes();
+    if (!changes.upserts.length && !changes.deletes.length) return;
+    try {
+      this.ctx.storage.transactionSync(() => {
+        for (const { socket, id } of changes.deletes)
+          this.sql.exec(
+            "DELETE FROM _naru_subscriptions WHERE socket = ? AND id = ?",
+            socket,
+            id,
+          );
+        for (const row of changes.upserts)
+          this.sql.exec(
+            `INSERT INTO _naru_subscriptions (socket, id, member, query, args, tables, hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (socket, id) DO UPDATE SET member = excluded.member,
+               query = excluded.query, args = excluded.args,
+               tables = excluded.tables, hash = excluded.hash`,
+            row.socket,
+            row.id,
+            row.member,
+            row.query,
+            row.args,
+            row.tables,
+            row.hash,
+          );
+      });
+    } catch (error) {
+      // Kept, to be written with the next: the timer is set again.
+      console.error("could not write the live queries' checkpoint", error);
+      this.flushLiveSoon();
+      return;
+    }
+    this.live.wrote(changes);
   }
 
   /** Tables written since the last refresh, re-run together on the next turn. */
@@ -658,9 +693,18 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   private async refresh() {
     const written = this.refreshing ?? new Set<string>();
     this.refreshing = undefined;
-    const groups = new Map<string, Row[]>();
-    for (const row of this.rows("SELECT * FROM _naru_subscriptions")) {
-      const tables = JSON.parse(String(row.tables)) as string[];
+    type Live = {
+      socket: string;
+      id: string;
+      query: string;
+      args: string;
+      tables: string;
+      sent?: string;
+    };
+    const groups = new Map<string, Live[]>();
+    for (const [socketId, id, s] of [...this.live.entries()]) {
+      const row: Live = { socket: socketId, id, ...s };
+      const tables = JSON.parse(row.tables) as string[];
       if (
         !written.has("*") &&
         !tables.includes("*") &&
@@ -669,11 +713,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         continue;
       const socket = this.ctx.getWebSockets(`socket:${row.socket}`)[0];
       if (!socket) {
-        this.sql.exec(
-          "DELETE FROM _naru_subscriptions WHERE socket = ?",
-          row.socket,
-        );
-        this.sentHashes.delete(String(row.socket));
+        this.live.close(row.socket);
+        this.flushLiveSoon();
         continue;
       }
       const me = socket.deserializeAttachment() as LiveSocket | null;
@@ -695,34 +736,26 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       const socket = this.ctx.getWebSockets(`socket:${first.socket}`)[0];
       const me = socket?.deserializeAttachment() as LiveSocket | null;
       if (!me) continue;
-      const [file, fn] = String(first.query).split(":");
+      const [file, fn] = first.query.split(":");
       const outcome = await this.liveRun(
         me,
         file,
         fn,
-        JSON.parse(String(first.args)),
+        JSON.parse(first.args),
         true,
       );
       const hash = outcome.ok
         ? outcome.value.hash
         : `error:${outcome.error.message}`;
       for (const row of rows) {
-        if (
-          this.sentHashes.get(String(row.socket))?.get(String(row.id)) === hash
-        )
-          continue;
-        this.sent(String(row.socket), String(row.id), hash);
-        const tables = outcome.ok
-          ? JSON.stringify(outcome.value.tables)
-          : String(row.tables);
-        if (tables !== row.tables)
-          this.sql.exec(
-            "UPDATE _naru_subscriptions SET hash = ?, tables = ? WHERE socket = ? AND id = ?",
-            hash,
-            tables,
-            row.socket,
-            row.id,
-          );
+        if (this.live.get(row.socket, row.id)?.sent === hash) continue;
+        this.live.answered(
+          row.socket,
+          row.id,
+          outcome.ok ? JSON.stringify(outcome.value.tables) : row.tables,
+          hash,
+        );
+        this.flushLiveSoon();
         for (const target of this.ctx.getWebSockets(`socket:${row.socket}`))
           liveSend(
             target,
