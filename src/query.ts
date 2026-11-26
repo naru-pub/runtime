@@ -1,8 +1,5 @@
 import { DataError } from "./site-data/validation";
-import {
-  COMPARISONS,
-  filters,
-} from "./site-data/filters";
+import { COMPARISONS, filters } from "./site-data/filters";
 import {
   decodeCursor,
   decodeMultiCursor,
@@ -40,6 +37,12 @@ export const SCHEMA = `
   DROP TABLE IF EXISTS _naru_sessions;
   DROP VIEW IF EXISTS _naru_member_roles;
   DROP TABLE IF EXISTS _naru_roles;
+  -- Each hour's requests by kind (site.ts hourly), keyed by hours since
+  -- the epoch: usage, not data, so dumps leave it out.
+  CREATE TABLE IF NOT EXISTS _naru_usage_hours (
+    hour INTEGER PRIMARY KEY,
+    counts TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS _naru_media (
     id TEXT PRIMARY KEY,
     url TEXT NOT NULL UNIQUE,

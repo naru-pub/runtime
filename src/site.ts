@@ -132,6 +132,7 @@ import type {
   Snapshot,
   Usage,
   MonthRequests,
+  HourlyUsage,
 } from "./types";
 import { DUMP_TABLES, ROUTES_OFF } from "./types";
 import {
@@ -279,6 +280,9 @@ const marked = <E extends DataError>(limit: Limit, error: E) => {
   limitOf.set(error, limit);
   return error;
 };
+/** Hours of requests kept for the owner's graph (hourly): 31 days. */
+const HOURS_KEPT = 31 * 24;
+const HOUR_MS = 3_600_000;
 /** Refusals' stats are written at most this often (noteLimited). */
 const LIMITED_SAVE_MS = 60_000;
 /** Mutations a member may make a minute. */
@@ -379,6 +383,79 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       this.stats = { month, counts: saved ? JSON.parse(saved) : {} };
     }
     this.stats.counts[kind] = (this.stats.counts[kind] ?? 0) + amount;
+    const counts = this.hour(Math.floor(Date.now() / HOUR_MS));
+    counts[kind] = (counts[kind] ?? 0) + amount;
+  }
+  /**
+   * The hours being counted, as table `_naru_usage_hours` holds them plus
+   * what came since: by kind as `tally` counts, and `busiest_minute`, the
+   * most rows a calendar minute of the hour read (thisMinute). Written only
+   * with the month's stats (saveHours), so an evicted object loses the
+   * hour's last few counts as it loses the month's.
+   */
+  private hours = new Map<number, Record<string, number>>();
+  private hour(hour: number) {
+    let counts = this.hours.get(hour);
+    if (!counts) {
+      const saved = this.sql
+        .exec("SELECT counts FROM _naru_usage_hours WHERE hour = ?", hour)
+        .toArray()[0];
+      counts = saved ? JSON.parse(String(saved.counts)) : {};
+      this.hours.set(hour, counts!);
+    }
+    return counts!;
+  }
+  /** Keeps a calendar minute's rows as its hour's busiest, if they are. */
+  private foldMinute(worked: { minute: number; rows: number }) {
+    if (!worked.rows) return;
+    const counts = this.hour(Math.floor((worked.minute * 60_000) / HOUR_MS));
+    if (worked.rows > (counts.busiest_minute ?? 0))
+      counts.busiest_minute = worked.rows;
+  }
+  /**
+   * Writes the hours being counted, forgets those before the last, and drops
+   * saved hours past HOURS_KEPT: with the month's stats, never on its own.
+   */
+  private saveHours() {
+    this.foldMinute(this.worked);
+    const now = Math.floor(Date.now() / HOUR_MS);
+    for (const [hour, counts] of this.hours) {
+      this.sql.exec(
+        "INSERT INTO _naru_usage_hours (hour, counts) VALUES (?, ?) ON CONFLICT (hour) DO UPDATE SET counts = excluded.counts",
+        hour,
+        JSON.stringify(counts),
+      );
+      // The last hour stays, in case this save is rolled back with its request.
+      if (hour < now - 1) this.hours.delete(hour);
+    }
+    this.sql.exec(
+      "DELETE FROM _naru_usage_hours WHERE hour <= ?",
+      now - HOURS_KEPT,
+    );
+  }
+  /** The kept hours with requests, for the owner's /database. */
+  private hourly(): HourlyUsage {
+    this.foldMinute(this.worked);
+    const now = Math.floor(Date.now() / HOUR_MS);
+    const hours = new Map<number, Record<string, number>>();
+    for (const row of this.sql
+      .exec(
+        "SELECT hour, counts FROM _naru_usage_hours WHERE hour > ? ORDER BY hour",
+        now - HOURS_KEPT,
+      )
+      .toArray())
+      hours.set(Number(row.hour), JSON.parse(String(row.counts)));
+    for (const [hour, counts] of this.hours)
+      if (hour > now - HOURS_KEPT) hours.set(hour, counts);
+    return {
+      rowsPerMinute: this.rowsPerMinute(),
+      hours: [...hours]
+        .sort(([a], [b]) => a - b)
+        .map(([hour, counts]) => ({
+          hour: hour * HOUR_MS,
+          counts: { ...counts },
+        })),
+    };
   }
   /**
    * Counts a refusal by `limit` in the month's stats, and writes them, outside
@@ -398,6 +475,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       `stats:${this.stats!.month}`,
       JSON.stringify(this.stats!.counts),
     );
+    this.saveHours();
   }
 
   constructor(ctx: DurableObjectState, env: SiteDataEnv) {
@@ -841,7 +919,10 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   private worked = { minute: 0, rows: 0 };
   private thisMinute() {
     const minute = Math.floor(Date.now() / 60000);
-    if (this.worked.minute !== minute) this.worked = { minute, rows: 0 };
+    if (this.worked.minute !== minute) {
+      this.foldMinute(this.worked);
+      this.worked = { minute, rows: 0 };
+    }
     return this.worked;
   }
   private rowsPerMinute() {
@@ -1213,6 +1294,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           `stats:${this.stats.month}`,
           JSON.stringify(this.stats.counts),
         );
+      this.saveHours();
       this.budget.unsaved = 0;
     }
   }
@@ -1321,9 +1403,14 @@ export class SiteData extends DurableObject<SiteDataEnv> {
             collections: this.rows(
               "SELECT id, name, read_access, write_access FROM collections ORDER BY name",
             ).map((row) => this.collection(row.id as string, row)),
-            // For the owner's /database: what the site holds, and what its
-            // members and visitors have used of the month's requests.
-            usage: { ...this.usage(), requests: this.requestsThisMonth() },
+            // For the owner's /database: what the site holds, what its
+            // members and visitors have used of the month's requests, and
+            // their last days by the hour.
+            usage: {
+              ...this.usage(),
+              requests: this.requestsThisMonth(),
+              hourly: this.hourly(),
+            },
           },
           publicRead,
         };
@@ -3645,6 +3732,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   async erase(): Promise<Outcome<null>> {
     await this.ctx.storage.deleteAll();
     this.budget = undefined;
+    this.hours.clear();
     // deleteAll drops the tables too; this instance may serve again.
     this.createTables();
     return { ok: true, value: null };

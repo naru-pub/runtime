@@ -159,3 +159,12 @@ export type MonthRequests = {
   resetsAt: number;
   kinds: Record<string, number>;
 };
+/**
+ * One hour of a site's member and visitor requests (UTC), for its owner's
+ * graph: the month's kinds (`visitor_read`, `member_query`, `rows`,
+ * `limited:<limit>` …) counted in that hour, and `busiest_minute`, the most
+ * rows any one calendar minute of it read.
+ */
+export type UsageHour = { hour: number; counts: Record<string, number> };
+/** The last days' hours that had requests, oldest first, and the rows-a-minute limit they meet. */
+export type HourlyUsage = { rowsPerMinute: number; hours: UsageHour[] };
