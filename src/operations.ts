@@ -45,6 +45,9 @@ const OPERATIONS = [
   "configureCollections",
   "mediaReferences",
   "siteTables",
+  // The last days by the hour, as the owner's listing has them, read
+  // without claiming the object: for the operators' views.
+  "hourlyUsage",
   // A page of one of the site's tables, for the owner's control panel.
   "tableRows",
   // One read-only statement of the owner's own SQL, from the same tab.
@@ -116,6 +119,8 @@ function dispatch(
       return stub.mediaReferences(input);
     case "siteTables":
       return stub.siteTables();
+    case "hourlyUsage":
+      return stub.hourlyUsage();
     case "trialMigrations":
       return stub.trialMigrations(input);
     case "tableRows":

@@ -1969,6 +1969,11 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     });
   }
 
+  /** The kept hours, as the owner's listing has them (`hourly`), for the operators. */
+  async hourlyUsage(): Promise<Outcome<HourlyUsage>> {
+    return this.run(() => this.hourly());
+  }
+
   /** The site's own tables and views with their columns, for naru-dev's types. */
   async siteTables() {
     return this.run(() =>
