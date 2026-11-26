@@ -129,6 +129,7 @@ import type {
   Served,
   Snapshot,
   Usage,
+  MonthRequests,
 } from "./types";
 import { DUMP_TABLES, ROUTES_OFF } from "./types";
 import {
@@ -258,6 +259,26 @@ const publicWritesSpent = (window: number) =>
     "Public write rate limit reached. Try again next minute.",
     secondsUntil(window + 60000),
   );
+/**
+ * The limit that refused a member's or visitor's request, counted in the
+ * month's stats as `limited:<limit>` (noteLimited) so the control plane can
+ * tell which sites meet their limits. The owner's own limits and one live
+ * connection's are not marked: they say nothing about the site's traffic.
+ */
+type Limit =
+  | "budget"
+  | "rows"
+  | "reads"
+  | "public_writes"
+  | "member_calls"
+  | "visitor_calls";
+const limitOf = new WeakMap<DataError, Limit>();
+const marked = <E extends DataError>(limit: Limit, error: E) => {
+  limitOf.set(error, limit);
+  return error;
+};
+/** Refusals' stats are written at most this often (noteLimited). */
+const LIMITED_SAVE_MS = 60_000;
 /** Mutations a member may make a minute. */
 const MEMBER_CALLS_PER_MINUTE = 30;
 /** Mutations visitors may make a minute: per address, and for the whole site. */
@@ -356,6 +377,25 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       this.stats = { month, counts: saved ? JSON.parse(saved) : {} };
     }
     this.stats.counts[kind] = (this.stats.counts[kind] ?? 0) + amount;
+  }
+  /**
+   * Counts a refusal by `limit` in the month's stats, and writes them, outside
+   * the refused request's rolled-back transaction: at once for the object's
+   * first refusal, then at most every LIMITED_SAVE_MS, so a caller hammering
+   * a limit writes little. A site past its budget saves nothing through
+   * `spend`, and the Worker answers its later refusals itself (website.ts),
+   * so what is saved here is what the control plane reads.
+   */
+  private limitedSavedAt = 0;
+  private noteLimited(limit: Limit) {
+    this.tally(`limited:${limit}`);
+    const now = Date.now();
+    if (now - this.limitedSavedAt < LIMITED_SAVE_MS) return;
+    this.limitedSavedAt = now;
+    this.setMeta(
+      `stats:${this.stats!.month}`,
+      JSON.stringify(this.stats!.counts),
+    );
   }
 
   constructor(ctx: DurableObjectState, env: SiteDataEnv) {
@@ -709,6 +749,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     }
   }
   private failure(error: DataError): Outcome<never> {
+    const limit = limitOf.get(error);
+    if (limit) this.noteLimited(limit);
     return {
       ok: false,
       error: {
@@ -748,7 +790,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   }
   /** Refuses a member's or visitor's request once the site has read its rows this minute. */
   private admitWork() {
-    if (this.thisMinute().rows >= this.rowsPerMinute()) throw busy();
+    if (this.thisMinute().rows >= this.rowsPerMinute())
+      throw marked("rows", busy());
   }
   /** Runs a member's or visitor's work, counting the rows it read. */
   private metered<T>(work: () => T): T {
@@ -927,9 +970,12 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         (this.env as { SITE_READS_PER_MINUTE?: string }).SITE_READS_PER_MINUTE,
       ) || READS_PER_MINUTE;
     if (count > limit)
-      throw rateLimited(
-        "Too many reads from here this minute. Try again next minute.",
-        secondsUntil((minute + 1) * 60000),
+      throw marked(
+        "reads",
+        rateLimited(
+          "Too many reads from here this minute. Try again next minute.",
+          secondsUntil((minute + 1) * 60000),
+        ),
       );
     this.readers.counts.set(key, count);
   }
@@ -974,7 +1020,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         this.rows("SELECT count FROM rate_limits WHERE key = ?", key)[0]
           ?.count ?? 0,
       );
-      if (count >= maximum) throw publicWritesSpent(window);
+      if (count >= maximum)
+        throw marked("public_writes", publicWritesSpent(window));
       this.sql.exec(
         "INSERT INTO rate_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT (key) DO UPDATE SET count = count + 1",
         key,
@@ -993,9 +1040,12 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         0,
     );
     if (count >= MEMBER_CALLS_PER_MINUTE)
-      throw rateLimited(
-        "Member call rate limit reached. Try again next minute.",
-        secondsUntil(window + 60000),
+      throw marked(
+        "member_calls",
+        rateLimited(
+          "Member call rate limit reached. Try again next minute.",
+          secondsUntil(window + 60000),
+        ),
       );
     this.sql.exec(
       "INSERT INTO rate_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT (key) DO UPDATE SET count = count + 1",
@@ -1056,7 +1106,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   }
 
   /** The month's requests so far, its budget, and when it starts again. */
-  private requestsThisMonth() {
+  private requestsThisMonth(): MonthRequests {
     const now = new Date();
     const month = now.toISOString().slice(0, 7);
     const used =
@@ -1101,7 +1151,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         unsaved: 0,
       };
     const limit = this.monthlyLimit();
-    if (this.budget.used >= limit) throw new BudgetSpent(limit, nextMonth(now));
+    if (this.budget.used >= limit)
+      throw marked("budget", new BudgetSpent(limit, nextMonth(now)));
     this.budget.used += 1;
     this.budget.unsaved += 1;
     if (this.budget.unsaved >= BUDGET_SAVE_EVERY) {
@@ -1176,8 +1227,13 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     });
   }
 
-  /** Sets what `serve` relies on (see EdgeConfiguration); reports usage. */
-  async configure(input: EdgeConfiguration): Promise<Outcome<Usage>> {
+  /**
+   * Sets what `serve` relies on (see EdgeConfiguration); reports usage, with
+   * the month's requests and the refusals among their kinds (`limited:*`).
+   */
+  async configure(
+    input: EdgeConfiguration,
+  ): Promise<Outcome<Usage & { requests: MonthRequests }>> {
     return this.run(() => {
       this.claim(input.ownerId);
       this.setMeta(
@@ -1195,7 +1251,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           "rows_per_minute",
           input.rowsPerMinute === null ? null : String(input.rowsPerMinute),
         );
-      return this.usage();
+      return { ...this.usage(), requests: this.requestsThisMonth() };
     });
   }
 
@@ -2212,9 +2268,12 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           ?.count ?? 0,
       );
       if (count >= maximum)
-        throw rateLimited(
-          "Visitor call rate limit reached. Try again next minute.",
-          secondsUntil(window + 60000),
+        throw marked(
+          "visitor_calls",
+          rateLimited(
+            "Visitor call rate limit reached. Try again next minute.",
+            secondsUntil(window + 60000),
+          ),
         );
       this.sql.exec(
         "INSERT INTO rate_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT (key) DO UPDATE SET count = count + 1",

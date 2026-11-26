@@ -148,3 +148,14 @@ export type EdgeConfiguration = {
 };
 
 export type Usage = { documents: number; bytes: number };
+/**
+ * A month's member and visitor requests against the site's budget, by kind,
+ * with the rows they read (`rows`) and the requests each limit refused
+ * (`limited:<limit>`).
+ */
+export type MonthRequests = {
+  used: number;
+  limit: number;
+  resetsAt: number;
+  kinds: Record<string, number>;
+};
