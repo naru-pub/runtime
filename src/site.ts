@@ -108,6 +108,7 @@ const fromDump = (value: DumpRow[string] | undefined): SqlValue =>
   value && typeof value === "object"
     ? new Uint8Array(Buffer.from(value.$base64, "base64")).buffer
     : (value ?? null);
+import { MinuteCounts } from "./minute-counts";
 import { hashPassword, verifyPassword } from "./passwords";
 import { quickjs } from "./quickjs";
 import {
@@ -491,6 +492,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         me.id,
         id,
       );
+      this.sentHashes.get(me.id)?.delete(id);
       return;
     }
     if (message.type !== "subscribe") return;
@@ -552,13 +554,16 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       JSON.stringify(outcome.value.tables),
       outcome.value.hash,
     );
+    this.sent(me.id, id, outcome.value.hash);
     liveSend(socket, { type: "result", id, result: outcome.value.result });
   }
 
   async webSocketClose(socket: WebSocket, code: number) {
     const me = socket.deserializeAttachment() as LiveSocket | null;
-    if (me)
+    if (me) {
       this.sql.exec("DELETE FROM _naru_subscriptions WHERE socket = ?", me.id);
+      this.sentHashes.delete(me.id);
+    }
     // 1005 (no code) and 1006 (dropped) are only ever received, never sent.
     socket.close(code === 1005 || code === 1006 ? 1000 : code);
   }
@@ -618,6 +623,23 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     };
   }
 
+  /**
+   * The hash of the answer each subscription was last sent, by socket and
+   * subscription, in memory. A refresh writes a subscription's row only when
+   * the tables it read change, not each time its answer does: a busy site's
+   * live queries rewrote their rows on every write to what they read. What
+   * the row keeps is what a refresh needs after the object is put away with
+   * its sockets open (hibernation): what it reads, and so which writes re-run
+   * it. A subscription with no hash here (the object started again since)
+   * is sent its answer: at worst one it already has, never one it lacks.
+   */
+  private sentHashes = new Map<string, Map<string, string>>();
+  private sent(socket: string, id: string, hash: string) {
+    let hashes = this.sentHashes.get(socket);
+    if (!hashes) this.sentHashes.set(socket, (hashes = new Map()));
+    hashes.set(id, hash);
+  }
+
   /** Tables written since the last refresh, re-run together on the next turn. */
   private refreshing?: Set<string>;
   private scheduleRefresh(tables: Iterable<string>) {
@@ -651,6 +673,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           "DELETE FROM _naru_subscriptions WHERE socket = ?",
           row.socket,
         );
+        this.sentHashes.delete(String(row.socket));
         continue;
       }
       const me = socket.deserializeAttachment() as LiveSocket | null;
@@ -684,14 +707,22 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         ? outcome.value.hash
         : `error:${outcome.error.message}`;
       for (const row of rows) {
-        if (row.hash === hash) continue;
-        this.sql.exec(
-          "UPDATE _naru_subscriptions SET hash = ?, tables = ? WHERE socket = ? AND id = ?",
-          hash,
-          outcome.ok ? JSON.stringify(outcome.value.tables) : row.tables,
-          row.socket,
-          row.id,
-        );
+        if (
+          this.sentHashes.get(String(row.socket))?.get(String(row.id)) === hash
+        )
+          continue;
+        this.sent(String(row.socket), String(row.id), hash);
+        const tables = outcome.ok
+          ? JSON.stringify(outcome.value.tables)
+          : String(row.tables);
+        if (tables !== row.tables)
+          this.sql.exec(
+            "UPDATE _naru_subscriptions SET hash = ?, tables = ? WHERE socket = ? AND id = ?",
+            hash,
+            tables,
+            row.socket,
+            row.id,
+          );
         for (const target of this.ctx.getWebSockets(`socket:${row.socket}`))
           liveSend(
             target,
@@ -1005,41 +1036,32 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     return matches;
   }
 
+  /**
+   * Public writes, members' and visitors' mutations a minute, kept in memory
+   * (minute-counts.ts says why). The `rate_limits` table they were kept in
+   * stays, empty, as dumps carry it.
+   */
+  private minuteCalls = new MinuteCounts();
+
   /** Fixed-minute buckets: 60 public writes per site, 20 per caller. */
   private limitPublicWrite(clientIp?: string) {
     const window = Math.floor(Date.now() / 60000) * 60000;
-    this.sql.exec("DELETE FROM rate_limits WHERE window_start < ?", window);
     const caller = createHash("sha256")
       .update(callerKey(clientIp))
       .digest("base64url");
-    for (const [key, maximum] of [
-      ["site", 60],
-      [`ip:${caller}`, 20],
-    ] as const) {
-      const count = Number(
-        this.rows("SELECT count FROM rate_limits WHERE key = ?", key)[0]
-          ?.count ?? 0,
-      );
-      if (count >= maximum)
-        throw marked("public_writes", publicWritesSpent(window));
-      this.sql.exec(
-        "INSERT INTO rate_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT (key) DO UPDATE SET count = count + 1",
-        key,
-        window,
-      );
-    }
+    if (
+      this.minuteCalls.take([
+        ["site", 60],
+        [`ip:${caller}`, 20],
+      ])
+    )
+      throw marked("public_writes", publicWritesSpent(window));
   }
 
   /** A member's mutations a minute, in fixed-minute buckets like visitors'. */
   private limitMember(member: string) {
     const window = Math.floor(Date.now() / 60000) * 60000;
-    this.sql.exec("DELETE FROM rate_limits WHERE window_start < ?", window);
-    const key = `call:${member}`;
-    const count = Number(
-      this.rows("SELECT count FROM rate_limits WHERE key = ?", key)[0]?.count ??
-        0,
-    );
-    if (count >= MEMBER_CALLS_PER_MINUTE)
+    if (this.minuteCalls.take([[`call:${member}`, MEMBER_CALLS_PER_MINUTE]]))
       throw marked(
         "member_calls",
         rateLimited(
@@ -1047,11 +1069,6 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           secondsUntil(window + 60000),
         ),
       );
-    this.sql.exec(
-      "INSERT INTO rate_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT (key) DO UPDATE SET count = count + 1",
-      key,
-      window,
-    );
   }
 
   private written(collectionId: string, id: string) {
@@ -2253,34 +2270,24 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   /** A visitor's mutations a minute, by address and for the whole site. */
   private limitVisitor(clientIp: string | undefined) {
     const window = Math.floor(Date.now() / 60000) * 60000;
-    this.sql.exec("DELETE FROM rate_limits WHERE window_start < ?", window);
     const kind = "visitor-call";
     const limits = VISITOR_CALLS;
     const caller = createHash("sha256")
       .update(callerKey(clientIp))
       .digest("base64url");
-    for (const [key, maximum] of [
-      [`${kind}:site`, limits.site],
-      [`${kind}:${caller}`, limits.address],
-    ] as const) {
-      const count = Number(
-        this.rows("SELECT count FROM rate_limits WHERE key = ?", key)[0]
-          ?.count ?? 0,
+    if (
+      this.minuteCalls.take([
+        [`${kind}:site`, limits.site],
+        [`${kind}:${caller}`, limits.address],
+      ])
+    )
+      throw marked(
+        "visitor_calls",
+        rateLimited(
+          "Visitor call rate limit reached. Try again next minute.",
+          secondsUntil(window + 60000),
+        ),
       );
-      if (count >= maximum)
-        throw marked(
-          "visitor_calls",
-          rateLimited(
-            "Visitor call rate limit reached. Try again next minute.",
-            secondsUntil(window + 60000),
-          ),
-        );
-      this.sql.exec(
-        "INSERT INTO rate_limits (key, window_start, count) VALUES (?, ?, 1) ON CONFLICT (key) DO UPDATE SET count = count + 1",
-        key,
-        window,
-      );
-    }
   }
 
   /**
@@ -2741,6 +2748,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       this.sql.exec("DELETE FROM documents");
       this.sql.exec("DELETE FROM collections");
       this.sql.exec("DELETE FROM rate_limits");
+      this.minuteCalls.clear();
       this.sql.exec("DELETE FROM meta");
       this.budget = undefined;
       if (snapshot.ownerId !== null) this.setMeta("owner_id", snapshot.ownerId);
