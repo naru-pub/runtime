@@ -470,7 +470,7 @@ statement, writes included), three password hashes or checks, 1,000 URL
 parses and 2,000 `Math.random()` draws, read at most 500,000 rows in all, run for tens of milliseconds in
 32 MiB of memory, and return at most 1 MiB of JSON. Queries are limited as
 reads are: 600 a minute per member, or per address for visitors. A member may
-make 30 mutations a minute; visitors 20 a minute per address and 300 a minute
+make 120 mutations a minute; visitors 60 a minute per address and 600 a minute
 for the whole site. Members' and visitors' calls count against the site's
 monthly budget; the owner's do not. The files under `_naru/` are not served:
 the site's pages and its files' addresses answer 404 for them, and visitors

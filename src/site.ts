@@ -289,10 +289,14 @@ const HOURS_KEPT = 31 * 24;
 const HOUR_MS = 3_600_000;
 /** Refusals' stats are written at most this often (noteLimited). */
 const LIMITED_SAVE_MS = 60_000;
-/** Mutations a member may make a minute. */
-const MEMBER_CALLS_PER_MINUTE = 30;
+/**
+ * Mutations a member may make a minute: enough for a page that saves as it
+ * goes (a file in parts, a game's moves). What keeps a site from slowing the
+ * others is its rows a minute, which every call counts against.
+ */
+const MEMBER_CALLS_PER_MINUTE = 120;
 /** Mutations visitors may make a minute: per address, and for the whole site. */
-const VISITOR_CALLS = { address: 20, site: 300 };
+const VISITOR_CALLS = { address: 60, site: 600 };
 /**
  * Rows SQLite may read a minute for a site's members and visitors: about 5 s
  * of the one thread every site shares, so a site whose queries scan (contains
