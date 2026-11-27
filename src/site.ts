@@ -232,8 +232,12 @@ const outsideScope = (collection: string) =>
   );
 const unsupported = () =>
   new DataError(400, "Data contains unsupported characters or numbers.");
-/** Anonymous requests a site may make each calendar month (UTC). */
-const DEFAULT_MONTHLY_REQUESTS = 5_000_000;
+/**
+ * Member and visitor requests a site may make each calendar month (UTC).
+ * What keeps one site from slowing the others is its rows a minute; this
+ * only stops a site that runs away for days.
+ */
+const DEFAULT_MONTHLY_REQUESTS = 20_000_000;
 /** The pauses of a site's statements kept for its owner (breaker.ts). */
 const BREAKER_TRIPS_KEPT = 50;
 /** The count is kept in memory and written every this many requests. */
@@ -2221,10 +2225,13 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     }
     const admitted = this.run(() => {
       this.claim(input.ownerId);
-      // A live refresh is the site's doing, so it is never limited per
-      // caller, but a member's or visitor's spends the month's budget.
+      // A live refresh is the site's doing, after a write the budget
+      // already counted: it is counted, never limited per caller and not
+      // spent from the budget, or a page that subscribes instead of polling
+      // would pay for every open tab on every write. Its rows still count
+      // against the site's rows a minute (metered).
       if (input.live === "refresh") {
-        if (visitor || input.member !== null) this.spend("live_refresh");
+        if (visitor || input.member !== null) this.tally("live_refresh");
         return;
       }
       if (visitor || input.member !== null) this.admitWork();
