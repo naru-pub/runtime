@@ -110,6 +110,7 @@ const fromDump = (value: DumpRow[string] | undefined): SqlValue =>
     : (value ?? null);
 import { FLUSH_DELAY_MS, LiveRegistry } from "./live-registry";
 import { MinuteCounts } from "./minute-counts";
+import { Confirmation } from "./confirmation";
 import { hashPassword, verifyPassword } from "./passwords";
 import { quickjs } from "./quickjs";
 import {
@@ -503,7 +504,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     if (
       this.meta("owner_id") === null ||
       until === null ||
-      Number(this.meta("confirmed_until") ?? 0) <= now ||
+      this.confirmedUntil() <= now ||
       (until !== "forever" && Number(until) <= now)
     )
       return new Response("Live connections are unavailable.", {
@@ -950,12 +951,23 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     }
   }
 
+  /** The last sync's confirmation, held in memory (confirmation.ts). */
+  private confirmation = new Confirmation();
+  private writtenConfirmation() {
+    return Number(this.meta("confirmed_until") ?? 0);
+  }
+  private confirmedUntil() {
+    return this.confirmation.until(this.writtenConfirmation());
+  }
+
   private meta(key: string): string | null {
     return (this.rows("SELECT value FROM meta WHERE key = ?", key)[0]?.value ??
       null) as string | null;
   }
 
+  /** Writes a setting, unless it already holds `value`: a write commits. */
   private setMeta(key: string, value: string | null) {
+    if (this.meta(key) === value) return;
     if (value === null) this.sql.exec("DELETE FROM meta WHERE key = ?", key);
     else
       this.sql.exec(
@@ -1332,7 +1344,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   async serve(input: ServeInput): Promise<Outcome<Served>> {
     const ownerId = this.meta("owner_id");
     const until = this.meta("entitled_until");
-    const confirmed = Number(this.meta("confirmed_until") ?? 0);
+    const confirmed = this.confirmedUntil();
     const now = Date.now();
     if (
       ownerId === null ||
@@ -1372,7 +1384,10 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         "entitled_until",
         input.entitledUntil === null ? "forever" : String(input.entitledUntil),
       );
-      this.setMeta("confirmed_until", String(input.confirmedUntil));
+      if (
+        this.confirmation.take(input.confirmedUntil, this.writtenConfirmation())
+      )
+        this.setMeta("confirmed_until", String(input.confirmedUntil));
       if (input.monthlyRequests !== undefined)
         this.setMeta(
           "monthly_requests",
@@ -2320,7 +2335,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     if (
       ownerId === null ||
       until === null ||
-      Number(this.meta("confirmed_until") ?? 0) <= now ||
+      this.confirmedUntil() <= now ||
       (until !== "forever" && Number(until) <= now) ||
       !this.meta("functions_revision")
     )
@@ -2356,7 +2371,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     if (
       ownerId === null ||
       until === null ||
-      Number(this.meta("confirmed_until") ?? 0) <= now ||
+      this.confirmedUntil() <= now ||
       (until !== "forever" && Number(until) <= now)
     )
       return {
