@@ -123,8 +123,9 @@ It returns:
 The site's data runs on Naru's own edge Worker (the code that serves
 `sdk.naru.pub`) under workerd, with SQLite-backed Durable Objects: the
 collections and their rules, the site's tables, queries, mutations, routes
-and live queries, the QuickJS runtime and its limits, revision conditions
-and batches, behave as on Naru. A process in front stands in for naru.pub's
+and live queries, site code's isolates and their limits, revision conditions
+and batches, behave as on Naru, except that npm's workerd enforces no CPU or
+memory limit on site code (Naru's own build does: 50 ms and 64 MiB a call). A process in front stands in for naru.pub's
 part.
 
 Not emulated: payments and supporter plans (every member may sign in),

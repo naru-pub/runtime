@@ -68,10 +68,14 @@ such as the `functions/` and `rules/` folders of an early 1.1.0, no longer
 validates: such a site's code must be published again.
 
 Activation changes only the pointer after validation and storage finish.
-Each call pins its revision and loads its complete module graph before
-entering the synchronous SQLite transaction; QuickJS imports then resolve
-exclusively from that graph. Read-only queries and routes, rollback, CPU,
-memory and host-operation limits apply equally to imported code.
+Each call pins its revision. The site's object loads the revision into an
+isolate of its own (`src/functions.ts`, a Worker Loader binding): every module
+a call may name (`queries/`, `mutations/`, `routes.js`) and everything they
+import, behind an entry module of Naru's, so imports resolve exclusively from
+the revision's files. The call then runs inside the object's SQLite
+transaction, its `ctx` operations answered by the object over RPC.
+Read-only queries and routes, rollback, CPU, memory and host-operation limits
+apply equally to imported code.
 
 ## Migrations
 
@@ -203,8 +207,10 @@ Each graph allows 64 modules and 1 MiB of source; each file allows 256 KiB. A
 revision allows 256 files and 4 MiB. Each Worker isolate keeps up to 64
 manifests and 32 MiB (2,048 entries) of sources in memory, shared by its
 sites' objects and named by their hashes, so sites cannot see each other's;
-eviction, restart and new source hashes still read from R2. QuickJS runtimes
-are fresh per call.
+eviction, restart and new source hashes still read from R2. A revision's
+isolate is loaded once and kept while it is used, so its modules' top-level
+values live across calls and callers; one unused for a while is unloaded, and
+a new revision gets a new isolate.
 
 After activation, the Absurd task waits five minutes and deletes the previous
 release's entire directory through the control plane's S3 client, then

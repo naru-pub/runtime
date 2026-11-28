@@ -100,7 +100,7 @@ export function moduleImports(source: string, filename: string): string[] {
   return [...new Set(imports)];
 }
 
-/** Storage I/O finishes before QuickJS and the synchronous SQLite transaction. */
+/** Storage I/O finishes before the call's isolate runs, and its transaction begins. */
 export async function loadModuleGraph(
   entry: string,
   read: (path: string) => Promise<string | null>,

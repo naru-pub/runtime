@@ -10,5 +10,7 @@
   "durable_objects": {
     "bindings": [{ "name": "SITES", "class_name": "SiteData" }],
   },
+  // Each release of a site's code in an isolate of its own (src/functions.ts).
+  "worker_loaders": [{ "binding": "LOADER" }],
   "workers_dev": false,
 }

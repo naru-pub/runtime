@@ -29,7 +29,13 @@ import {
   restorePointOf,
   restorePointsPrefix,
 } from "./site-functions/restore-points";
-import { runFunction, type Host } from "./functions";
+import {
+  runFunction,
+  workerCode,
+  type Host,
+  type Loader,
+  type SiteCode,
+} from "./functions";
 import {
   MAX_NOTIFY_RECIPIENTS,
   MAX_OUTBOX_ROWS,
@@ -112,7 +118,6 @@ import { FLUSH_DELAY_MS, LiveRegistry } from "./live-registry";
 import { MinuteCounts } from "./minute-counts";
 import { Confirmation } from "./confirmation";
 import { hashPassword, verifyPassword } from "./passwords";
-import { quickjs } from "./quickjs";
 import {
   documentOf,
   fieldIndex,
@@ -368,6 +373,8 @@ function encode(data: unknown) {
 export interface SiteDataEnv {
   /** Site functions' sources, releases and restore points. */
   PRIVATE_FILES: R2Bucket;
+  /** Loads each release of site code into an isolate of its own (functions.ts). */
+  LOADER: Loader;
 }
 
 export class SiteData extends DurableObject<SiteDataEnv> {
@@ -899,6 +906,23 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       throw error;
     }
   }
+  /**
+   * `work` in one transaction that may await (a call of site code), as `run`
+   * answers a synchronous one: a throw rolls it back. transaction() is a
+   * blockConcurrencyWhile(), so other requests wait for it to end. Writes not
+   * yet confirmed (a call's admission, say) would hold the call to the
+   * site's isolate at the output gate, which the open transaction would keep
+   * shut: they are confirmed first.
+   */
+  private async transact<T>(work: () => Promise<T>): Promise<Outcome<T>> {
+    await this.ctx.storage.sync();
+    try {
+      return { ok: true, value: await this.ctx.storage.transaction(work) };
+    } catch (error) {
+      if (error instanceof DataError) return this.failure(error);
+      throw error;
+    }
+  }
   private failure(error: DataError): Outcome<never> {
     const limit = limitOf.get(error);
     if (limit) this.noteLimited(limit);
@@ -952,6 +976,18 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     const before = this.rowsRead;
     try {
       return work();
+    } finally {
+      const rows = this.rowsRead - before;
+      this.thisMinute().rows += rows;
+      this.tally("rows", rows);
+    }
+  }
+
+  /** `metered` for work that awaits; no other request runs meanwhile (transact). */
+  private async meteredAsync<T>(work: () => Promise<T>): Promise<T> {
+    const before = this.rowsRead;
+    try {
+      return await work();
     } finally {
       const rows = this.rowsRead - before;
       this.thisMinute().rows += rows;
@@ -2216,7 +2252,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     const visitor = input.member === null && input.visitor === true;
     const kind = input.kind;
     const readonly = kind === "query" || kind === "route";
-    let filename: string, sources;
+    let filename: string, code: SiteCode;
     try {
       if (!["query", "mutation", "route"].includes(kind))
         throw new DataError(400, "Invalid call.");
@@ -2234,7 +2270,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           ? "routes"
           : `${kind === "query" ? "queries" : "mutations"}/${input.file}`,
       );
-      sources = await revisions.graph(revision, filename);
+      code = await this.siteCode(input.site, revision, filename);
     } catch (error) {
       if (error instanceof DataError)
         return this.run(() => {
@@ -2273,48 +2309,40 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       this.limitMember(input.member);
     });
     if (!admitted.ok) return admitted;
-    const engine = await quickjs();
     const tables: SqlTables = { read: new Set(), written: new Set() };
+    // A live refresh is metered too, though never refused for its rows:
+    // the write that caused it was admitted.
+    const counted = visitor || input.member !== null;
+    const run = () =>
+      runFunction(
+        code,
+        {
+          filename,
+          name: input.name,
+          args: input.args,
+          member: input.member,
+          owner: input.member === null && !visitor,
+          now: Date.now(),
+          readonly,
+          kind,
+          ownerName: input.site,
+        },
+        this.siteHost(tables, {
+          site: input.site,
+          kind,
+          file: input.file,
+          name: input.name,
+        }),
+      );
+    let outcome: Outcome<{ result: unknown; tables?: string[] }>;
     try {
-      // A live refresh is metered too, though never refused for its rows:
-      // the write that caused it was admitted.
-      const counted = visitor || input.member !== null;
-      const outcome = this.run(() => ({
-        result: (counted
-          ? <T>(work: () => T) => this.metered(work)
-          : <T>(work: () => T) => work())(() =>
-          runFunction(
-            engine,
-            {
-              source: sources[filename],
-              filename,
-              modules: sources,
-              name: input.name,
-              args: input.args,
-              member: input.member,
-              owner: input.member === null && !visitor,
-              now: Date.now(),
-              readonly,
-              kind,
-              ownerName: input.site,
-            },
-            this.siteHost(tables, {
-              site: input.site,
-              kind,
-              file: input.file,
-              name: input.name,
-            }),
-          ),
-        ),
+      outcome = await this.transact(async () => ({
+        result: await (counted ? this.meteredAsync(run) : run()),
         ...(input.live ? { tables: [...tables.read].sort() } : {}),
       }));
-      if (outcome.ok && tables.written.size)
-        this.scheduleRefresh(tables.written);
-      return outcome;
     } catch (error) {
-      // Not the code's doing: the engine itself failed. The call retired its
-      // instance (functions.ts), and the next starts a new one.
-      console.error("A site function's engine failed", error);
+      // Not the code's doing: the runtime failed to run it.
+      console.error("A site function's isolate failed", error);
       return {
         ok: false,
         error: {
@@ -2324,6 +2352,28 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         },
       };
     }
+    if (outcome.ok && tables.written.size) this.scheduleRefresh(tables.written);
+    return outcome;
+  }
+
+  /**
+   * The isolate running `revision` of the site's code (functions.ts), loaded
+   * by the Worker Loader under the site's and the release's names, so each
+   * release of each site has its own; one the object has not used for a
+   * while is unloaded. Refuses an entry the release does not have.
+   */
+  private async siteCode(
+    site: string,
+    revision: string,
+    filename: string,
+  ): Promise<SiteCode> {
+    const revisions = this.revisions(site);
+    const release = await revisions.code(revision);
+    if (!release.entries.includes(filename))
+      throw new DataError(404, `This site has no _naru/${filename}.`);
+    return this.env.LOADER.get(`${site}:${revision}`, async () =>
+      workerCode(release.modules, release.entries),
+    ).getEntrypoint();
   }
 
   /**

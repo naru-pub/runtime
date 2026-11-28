@@ -7,8 +7,8 @@ import type { SqlValue } from "./query";
 // anything naming one of Naru's, or doing what is Naru's to do (pragmas,
 // attaching, triggers, transactions), is refused before it runs.
 //
-// SQLite's time is outside the fuel meter (engine.ts), and the mini's runtime
-// has no CPU limit, so Naru's workerd on the mini stops any one step of a
+// SQLite runs in the site's object, whose time is not the site code's CPU
+// (functions.ts) and has no limit of its own, so Naru's workerd on the mini stops any one step of a
 // statement after 3 seconds (Naru's own workerd build, `interrupted` below), and a
 // statement stopped again and again is paused (breaker.ts).
 

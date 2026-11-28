@@ -361,6 +361,28 @@ export class FunctionRevisions {
     );
   }
 
+  /**
+   * Everything a release's isolate runs: each module a call may name (the
+   * files of `queries/` and `mutations/`, and `routes.js`) and what they
+   * import, by their names under `_naru/`.
+   */
+  async code(
+    revision: string,
+  ): Promise<{ entries: string[]; modules: ModuleSources }> {
+    const manifest = await this.manifest(revision);
+    const entries = Object.keys(manifest.files)
+      .filter(
+        (filename) =>
+          /^(queries|mutations)\/.+\.m?js$/.test(filename) ||
+          /^routes\.m?js$/.test(filename),
+      )
+      .sort();
+    const modules: ModuleSources = Object.create(null);
+    for (const entry of entries)
+      Object.assign(modules, await this.graph(revision, entry));
+    return { entries, modules };
+  }
+
   async graph(revision: string, entry: string): Promise<ModuleSources> {
     const manifest = await this.manifest(revision);
     if (!Object.hasOwn(manifest.files, entry))

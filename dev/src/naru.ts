@@ -307,6 +307,8 @@ export async function start(
       resources.workerd,
       [
         "serve",
+        // Worker Loader bindings (site code) are experimental.
+        "--experimental",
         join(resources.workerDir, "config.capnp"),
         "--directory-path",
         `site-objects=${objects}`,

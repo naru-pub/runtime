@@ -9,9 +9,8 @@ same code; the rest of Naru (accounts, hosting, billing) is not here.
 | Folder | What it is |
 | --- | --- |
 | [`sdk/`](sdk/) | The Data SDK: its source (`source/<version>/naru.ts`), the committed files Naru serves at `https://sdk.naru.pub/sdk/<version>/` (`files/`), and the [`@naru-pub/sdk`](https://www.npmjs.com/package/@naru-pub/sdk) package |
-| [`src/`](src/) | The runtime, a Cloudflare Workers-style module run under [workerd](https://github.com/cloudflare/workerd): `site.ts` (a site's object and its database), `website.ts` (the data API and live connections), `functions.ts` and `quickjs.ts` (site code, metered in QuickJS), `operations.ts` (the operations on a site), and `dev.ts`, naru-dev's entry |
+| [`src/`](src/) | The runtime, a Cloudflare Workers-style module run under [workerd](https://github.com/cloudflare/workerd): `site.ts` (a site's object and its database), `website.ts` (the data API and live connections), `functions.ts` (site code, each release in an isolate of its own), `operations.ts` (the operations on a site), and `dev.ts`, naru-dev's entry |
 | [`dev/`](dev/) | [`@naru-pub/dev`](https://www.npmjs.com/package/@naru-pub/dev): run and test a Naru site locally |
-| [`quickjs/`](quickjs/) | The metered QuickJS WebAssembly site code runs in, and the tool that makes it |
 | [`docs/`](docs/) | The [Data SDK v1 reference](docs/sdk-v1-api.md); [`FUNCTION-IMPORTS.md`](FUNCTION-IMPORTS.md) on how site code is published and run |
 
 ## Development

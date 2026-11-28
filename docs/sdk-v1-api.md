@@ -410,34 +410,25 @@ fails with `INVALID_REQUEST` and rolls back, since a mistake like
 `if (!ctx.passwords.verify(...))` would otherwise go unnoticed. Awaiting
 anything other than `ctx` (a promise that never resolves) fails the call.
 
-**The runtime's globals.** Queries, mutations and routes run in QuickJS, not
-in a browser or Node. They have the JavaScript language's own globals
-(`Object`, `Array`, `JSON`, `Math`, `Date`, `RegExp`, `Map`, `Set`, `WeakMap`,
-`WeakSet`, `WeakRef`, `Promise`, `Proxy`, `Reflect`, `Symbol`, `BigInt`,
-`Iterator`, `ArrayBuffer`, `DataView` and the typed arrays including
-`Float16Array`, the `Error` types, `encodeURIComponent` and the other URI
-functions, `parseInt` and the like), and besides them:
+**The runtime's globals.** Queries, mutations and routes run in a V8 isolate
+of their own, one for each release of the site's code, with the globals of a
+Cloudflare Worker: the JavaScript language's own, and `URL` and
+`URLSearchParams`, `structuredClone`, `Intl`, `TextEncoder` and
+`TextDecoder`, `atob` and `btoa`, `crypto` (`getRandomValues` and `subtle`),
+`setTimeout` and the other timers, `performance.now()`, `queueMicrotask`,
+`DOMException` and the like. The isolate has no network (`fetch` throws) and
+no bindings, and compiles no code at run time: `eval`, `new Function` and
+`WebAssembly.compile` throw. `console` output is discarded: return what you
+want to see, or `ctx.fail` with `details`. `Date` and `Date.now()` are the
+server's clock; prefer `ctx.now`, fixed for the call. Local time is the
+server's, which need not be Korea's: use `toISOString()` or the `getUTC…`
+methods and add the offset you want.
 
-- `URL` and `URLSearchParams`, as browsers have them (at most 1,000 parses a
-  call);
-- `structuredClone(value)`, for primitives, plain objects and arrays, `Date`,
-  `RegExp`, `Map`, `Set`, `ArrayBuffer` and `Uint8Array`, keeping cycles;
-  anything else (functions, class instances, other typed arrays) throws a
-  `DataCloneError`;
-- `Math.random()`, from the host's random source (at most 2,000 draws a
-  call);
-- `Date` and `Date.now()`, the server's clock; prefer `ctx.now`, fixed for
-  the call. Local time is the server's, which need not be Korea's: use
-  `toISOString()` or the `getUTC…` methods and add the offset you want;
-- `performance.now()`, `queueMicrotask`, `DOMException`.
-
-There is no `Intl` (`toLocaleString` formats as English, without grouping),
-no `TextEncoder` or `TextDecoder`, no `atob` or `btoa`, no `crypto` (hash
-guest passwords with `ctx.passwords`), no `console` (`console.log` throws a
-ReferenceError; return what you want to see, or `ctx.fail` with `details`),
-no `fetch` or other network, no `setTimeout` or other timers, and no
-`WebAssembly`, `require` or `process`. Strings have `normalize`,
-`localeCompare` and Unicode property escapes (`/\p{L}/u`).
+Values at a module's top level live as long as the isolate: across calls and
+across callers, until the site publishes new code or the isolate is unloaded
+after a while unused. A cache of what every caller may see is fine there;
+anything about one caller belongs in `ctx` or a table. A timer still pending
+when a call ends does nothing more through `ctx`.
 
 **Guest passwords.** Visitors can post and later edit with a password, as on
 a guest board. The site keeps the hash in its own table and never returns it:
@@ -466,9 +457,10 @@ export async function edit(ctx, { id, text, password }) {
 ```
 
 **Limits.** A call may make 100 database operations (each `ctx.sql`
-statement, writes included), three password hashes or checks, 1,000 URL
-parses and 2,000 `Math.random()` draws, read at most 500,000 rows in all, run for tens of milliseconds in
-32 MiB of memory, and return at most 1 MiB of JSON. Queries are limited as
+statement, writes included) and three password hashes or checks, read at most
+500,000 rows in all, run for 50 ms of CPU and 2 seconds in all, in the
+release's 64 MiB of memory, and return at most 1 MiB of JSON. A module's
+top-level code has the same 50 ms when the release loads. Queries are limited as
 reads are: 600 a minute per member, or per address for visitors. A member may
 make 120 mutations a minute; visitors 60 a minute per address and 600 a minute
 for the whole site. Members' and visitors' calls count against the site's

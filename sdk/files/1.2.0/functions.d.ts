@@ -10,19 +10,18 @@
  *   (await ctx.sql`SELECT id, title FROM posts WHERE board = ${board}`).rows;
  * ```
  *
- * The code runs in QuickJS, not a browser or Node. Its globals are the
- * language's own (Object, Array, JSON, Math, Date, RegExp, Map, Set, WeakMap,
- * WeakSet, WeakRef, Promise, Proxy, Reflect, Symbol, BigInt, Iterator,
- * ArrayBuffer, DataView, the typed arrays, the Error types, the URI
- * functions, parseInt and the like) and: URL and URLSearchParams, as
- * browsers have them; structuredClone, for primitives, plain objects and
- * arrays, Date, RegExp, Map, Set, ArrayBuffer and Uint8Array (anything else
- * throws a DataCloneError); Math.random; Date.now, the server's clock (prefer
- * `ctx.now`; local time is the server's, so use UTC methods);
- * performance.now, queueMicrotask and DOMException. There is no Intl
- * (toLocaleString formats as English), TextEncoder, TextDecoder, atob, btoa,
- * crypto, console, fetch, setTimeout or other timers, WebAssembly, require or
- * process, whatever your editor's lib types say.
+ * The code runs in a V8 isolate of its own, one for each release of the
+ * site's code, with the globals of a Cloudflare Worker: the language's own,
+ * and URL, structuredClone, Intl, TextEncoder and TextDecoder, atob and btoa,
+ * crypto (getRandomValues and subtle), timers, performance.now and the like.
+ * It has no network (fetch throws), no bindings, and compiles no code at run
+ * time (eval, new Function and WebAssembly.compile throw); console output is
+ * discarded. Date.now is the server's clock: prefer `ctx.now`, and since
+ * local time is the server's, use UTC methods.
+ *
+ * Module-level values live as long as the isolate, across calls and callers:
+ * a cache of something every caller may see is fine there; anything about
+ * one caller belongs in `ctx` or a table.
  *
  * Written by hand beside the generated naru.d.ts, whose `Json` this repeats
  * so this file stands on its own.
@@ -63,10 +62,10 @@ export interface SqlResult<Row> {
  * A query's or route's `ctx`: who calls, and the site's own tables through
  * `sql`. Anyone may call one, signed in or not, so its code decides what
  * each caller may see. A query's `sql` only reads. A call runs in one
- * transaction, for tens of milliseconds in 32 MiB, makes at most 100
- * database operations, 1,000 URL parses and 2,000 Math.random() draws,
- * reads at most 500,000 rows in all, and returns at most 1 MiB of JSON. Every method's promise must be
- * used (awaited, returned or chained), or the call fails.
+ * transaction, for at most 50 ms of CPU and 2 seconds in all, in a release's
+ * 64 MiB heap, makes at most 100 database operations, reads at most 500,000
+ * rows in all, and returns at most 1 MiB of JSON. Every method's promise must
+ * be used (awaited, returned or chained), or the call fails.
  */
 export interface QueryCtx {
   /** The signed-in member, or null for the owner and visitors. */

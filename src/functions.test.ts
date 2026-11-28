@@ -1,929 +1,478 @@
-import { readFileSync } from "node:fs";
-import { URL } from "node:url";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import type { QuickJSWASMModule } from "quickjs-emscripten-core";
-import { DataError } from "./site-data/validation";
-import { newEngine } from "./engine";
-import {
-  MAX_OPERATIONS,
-  MAX_RANDOM_DRAWS,
-  MAX_PASSWORD_OPERATIONS,
-  retired,
-  runFunction,
-  type Host,
-  type Invocation,
-} from "./functions";
+import { spawn, type ChildProcess } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { bundleWorker, modulesOf, runtime } from "../workerd-config.mjs";
+import type { HarnessCall } from "./functions.harness";
 
-// The engine in plain Node: the Worker's metered QuickJS build (engine.ts),
-// with an in-memory host standing in for the site's object.
-// (Workers' types declare no WebAssembly.Module constructor; Node has one.)
-const metered = new (
-  WebAssembly.Module as unknown as new (bytes: Uint8Array) => WebAssembly.Module
-)(readFileSync(new URL("../quickjs/metered.wasm", import.meta.url)));
-const engine = () => newEngine(metered);
+// Site code as the site's object runs it (functions.ts): functions.harness.ts
+// bundled by wrangler and served by workerd, npm's or, with NARU_WORKERD_BIN,
+// Naru's own with its CPU and heap limits (NARU_DYNAMIC_CPU_MS 50,
+// NARU_DYNAMIC_HEAP_MB 64), which only it enforces.
 
-let module: QuickJSWASMModule;
-let wallets: Map<string, number>;
-let operations: [string, unknown[]][];
-// Site SQL as the object answers it, for the few statements these tests
-// run: a wallet's balance, read and written, and a table that is always full.
-const host: Host = (operation, args) => {
-  operations.push([operation, args]);
-  switch (operation) {
-    case "random":
-      return 0.5;
-    case "passwordHash":
-      return `hash:${args[0]}`;
-    case "passwordVerify":
-      return args[1] === `hash:${args[0]}`;
-    case "sql": {
-      const [text, values, readonly] = args as [string, unknown[], boolean];
-      if (readonly && !/^SELECT/i.test(text))
-        throw new DataError(400, "A query's SQL only reads.");
-      if (/^SELECT balance FROM wallets/.test(text)) {
-        const balance = wallets.get(String(values[0]));
-        return {
-          rows: balance === undefined ? [] : [{ balance }],
-          changes: 0,
-        };
-      }
-      if (/^UPDATE wallets SET balance/.test(text)) {
-        wallets.set(String(values[1]), Number(values[0]));
-        return { rows: [], changes: 1 };
-      }
-      if (/^INSERT INTO full/.test(text))
-        throw new DataError(
-          409,
-          "Site database quota exceeded.",
-          "QUOTA_EXCEEDED",
-        );
-      return { rows: [], changes: 0 };
+const naru = process.env.NARU_WORKERD_BIN;
+// functions.ts's limits (it imports cloudflare:workers, which Node has not).
+const CALL_TIME_MS = 2000;
+const MAX_OPERATIONS = 100;
+const MAX_PASSWORD_OPERATIONS = 3;
+let dir: string;
+let worker: ChildProcess;
+let origin: string;
+
+const freePort = () =>
+  new Promise<number>((resolve) => {
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as { port: number };
+      server.close(() => resolve(port));
+    });
+  });
+
+beforeAll(async () => {
+  dir = await mkdtemp(join(tmpdir(), "naru-functions-"));
+  await writeFile(
+    join(dir, "wrangler.jsonc"),
+    JSON.stringify({
+      name: "naru-functions-harness",
+      main: join(runtime, "src/functions.harness.ts"),
+      compatibility_date: "2026-10-01",
+      durable_objects: { bindings: [{ name: "HARNESS", class_name: "Harness" }] },
+      exports: { Harness: { type: "durable-object", storage: "sqlite" } },
+      worker_loaders: [{ binding: "LOADER" }],
+    }),
+  );
+  bundleWorker(join(dir, "wrangler.jsonc"), join(dir, "dist"));
+  const modules = await modulesOf(
+    join(dir, "dist"),
+    "functions.harness.js",
+    "dist/",
+  );
+  await writeFile(
+    join(dir, "config.capnp"),
+    `using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+  services = [
+    (name = "main", worker = .worker),
+    (name = "objects", disk = (path = "objects", writable = true)),
+  ],
+  sockets = [(name = "http", address = "127.0.0.1:8787", http = (), service = "main")],
+);
+const worker :Workerd.Worker = (
+  compatibilityDate = "2026-10-01",
+  modules = [
+${modules.join("\n")}
+  ],
+  bindings = [
+    (name = "HARNESS", durableObjectNamespace = "Harness"),
+    (name = "LOADER", workerLoader = (id = "sites")),
+  ],
+  durableObjectNamespaces = [(className = "Harness", uniqueKey = "harness", enableSql = true)],
+  durableObjectStorage = (localDisk = "objects"),
+);
+`,
+  );
+  await mkdir(join(dir, "objects"));
+  const port = await freePort();
+  origin = `http://127.0.0.1:${port}`;
+  worker = spawn(
+    naru ?? join(runtime, "node_modules/.bin/workerd"),
+    [
+      "serve",
+      "--experimental",
+      "config.capnp",
+      "--socket-addr",
+      `http=127.0.0.1:${port}`,
+    ],
+    {
+      cwd: dir,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: {
+        ...process.env,
+        NARU_DYNAMIC_CPU_MS: "50",
+        NARU_DYNAMIC_HEAP_MB: "64",
+      },
+    },
+  );
+  for (let i = 0; i < 100; i++) {
+    try {
+      await fetch(`${origin}/wallets`);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    default:
-      throw new DataError(400, `ctx has no ${operation}.`);
   }
-};
-const run = (
+  throw new Error("workerd did not start.");
+}, 120_000);
+
+afterAll(async () => {
+  worker?.kill("SIGKILL");
+  if (dir) await rm(dir, { recursive: true, force: true });
+});
+
+type Result =
+  | { ok: true; result: unknown; operations: string[] }
+  | {
+      ok: false;
+      status?: number;
+      message?: string;
+      code?: string;
+      details?: unknown;
+      site?: boolean;
+      thrown?: string;
+      operations: string[];
+    };
+
+let objects = 0;
+/** A fresh object (scratch table) for each test that writes. */
+const fresh = () => `o${++objects}`;
+
+async function call(
   source: string,
   name: string,
-  args: unknown = null,
-  kind: Invocation["kind"] = "mutation",
-) =>
-  runFunction(
-    module,
-    {
-      source,
+  options: Partial<HarnessCall> & { object?: string } = {},
+): Promise<Result> {
+  const { object = "shared", ...rest } = options;
+  const kind = rest.kind ?? "mutation";
+  const entry =
+    rest.entry ??
+    (kind === "route"
+      ? "routes.js"
+      : `${kind === "query" ? "queries" : "mutations"}/test.js`);
+  const response = await fetch(`${origin}/?object=${object}`, {
+    method: "POST",
+    body: JSON.stringify({
+      modules: rest.modules ?? { [entry]: source },
+      entry,
       name,
-      args,
-      member: "m-1",
-      now: 1_700_000_000_000,
-      kind,
-      readonly: kind !== "mutation",
-    },
-    host,
-  );
-
-beforeEach(async () => {
-  module = await engine();
-  wallets = new Map();
-  operations = [];
-});
-// Calls share an instance, so an ordinary call, failed or not, must leave it
-// usable: only exhausting CPU or memory retires it (tested where it does).
-afterEach(() => {
-  expect(retired.has(module)).toBe(false);
-});
-
-test("one instance serves many calls, each freed before the next", () => {
-  wallets.set("m-1", 0);
-  // A megabyte a call, 100 MB in all: past the instance's 32 MiB unless freed.
-  for (let n = 0; n < 100; n++)
-    expect(
-      run(
-        `let calls = 0;
-        export async function f(ctx) {
-          const filler = "x".repeat(1 << 20);
-          const { rows } = await ctx.sql\`SELECT balance FROM wallets WHERE id = \${ctx.member.id}\`;
-          globalThis.leaked = filler;
-          return [++calls, rows[0].balance, filler.length];
-        }`,
-        "f",
-      ),
-    ).toEqual([1, 0, 1 << 20]);
-  try {
-    run(`export function f(ctx) { ctx.fail("CONFLICT", "No."); }`, "f");
-  } catch {}
-  try {
-    run(
-      `export async function f(ctx) { await ctx.sql("INSERT INTO full VALUES (1)"); }`,
-      "f",
-    );
-  } catch {}
-});
+      ...rest,
+    }),
+  });
+  return response.json() as Promise<Result>;
+}
+const wallets = async (object: string) =>
+  (await fetch(`${origin}/wallets?object=${object}`)).json();
 
 describe("calling", () => {
-  test("site code gets ctx and its arguments, and returns JSON", () => {
-    wallets.set("m-1", 150);
-    const result = run(
-      `export async function buy(ctx, { item, price }) {
-        const { rows: [wallet] } = await ctx.sql\`SELECT balance FROM wallets WHERE id = \${ctx.member.id}\`;
-        if (wallet.balance < price) return { ok: false };
-        await ctx.sql("UPDATE wallets SET balance = ? WHERE id = ?", [wallet.balance - price, ctx.member.id]);
-        return { ok: true, item, at: ctx.now, roll: Math.random(), more: [ctx.random, ctx.get, ctx.notify] };
-      }`,
-      "buy",
-      { item: "sword", price: 100 },
-    );
-    expect(result).toEqual({
-      ok: true,
-      item: "sword",
-      at: 1_700_000_000_000,
-      roll: 0.5,
-      // Math.random is the host's; ctx keeps no second way to it, and no
-      // collection or message methods.
-      more: [null, null, null],
-    });
-    expect(wallets.get("m-1")).toBe(50);
-    // A tagged template binds its values as parameters.
-    expect(operations[0]).toEqual([
-      "sql",
-      ["SELECT balance FROM wallets WHERE id = ?", ["m-1"], false],
-    ]);
-  });
-
-  test("ctx.owner says the site's owner called", () => {
-    const source =
-      "export function who(ctx) { return [ctx.owner, ctx.member]; }";
-    expect(run(source, "who")).toEqual([false, { id: "m-1" }]);
+  test("site code gets ctx and its arguments, and returns JSON", async () => {
     expect(
-      runFunction(
-        module,
-        {
-          source,
-          name: "who",
-          args: null,
-          member: null,
-          owner: true,
-          now: 0,
-          kind: "mutation",
-        },
-        host,
+      await call(
+        `export async function f(ctx, args) {
+          return { member: ctx.member, owner: ctx.owner, now: ctx.now, ownerName: ctx.ownerName, args };
+        }`,
+        "f",
+        { args: { a: [1, "two"] } },
       ),
-    ).toEqual([true, null]);
-  });
-
-  test("a visitor's call has neither a member nor the owner", () => {
-    const visit = (source: string) =>
-      runFunction(
-        module,
-        {
-          source,
-          name: "f",
-          args: null,
-          member: null,
-          now: 0,
-          kind: "query",
-          readonly: true,
-        },
-        host,
-      );
-    expect(
-      visit("export function f(ctx) { return [ctx.owner, ctx.member]; }"),
-    ).toEqual([false, null]);
-    // Uploads are deleted in the owner's media library, never by site code,
-    // which reads them in SQL (_naru_uploads) alone.
-    expect(
-      visit("export function f(ctx) { return ctx.media === undefined; }"),
-    ).toBe(true);
-  });
-
-  test("ctx.fail carries the code's details to the caller", () => {
-    const failure = (args: string) => {
-      try {
-        run(`export function f(ctx) { ctx.fail(${args}); }`, "f");
-      } catch (error) {
-        return error as DataError;
-      }
-      throw new Error("did not fail");
-    };
-    expect(
-      failure(`"CONFLICT", "품절입니다.", { reason: "sold_out" }`),
     ).toMatchObject({
+      ok: true,
+      result: {
+        member: { id: "m-1" },
+        owner: false,
+        now: 1_700_000_000_000,
+        ownerName: "jihyeok",
+        args: { a: [1, "two"] },
+      },
+    });
+  });
+
+  test("a query's, a route's and a mutation's ctx hold what each may do", async () => {
+    const keys = "export function f(ctx) { return Object.keys(ctx); }";
+    for (const kind of ["query", "route"] as const)
+      expect(await call(keys, "f", { kind })).toMatchObject({
+        result: ["member", "owner", "ownerName", "now", "fail", "sql", "passwords"],
+      });
+    expect(await call(keys, "f")).toMatchObject({
+      result: ["member", "owner", "ownerName", "now", "fail", "sql", "passwords", "notify"],
+    });
+    expect(
+      await call("export function f(ctx) { return Object.keys(ctx.passwords); }", "f", {
+        kind: "query",
+      }),
+    ).toMatchObject({ result: ["verify"] });
+  });
+
+  test("the owner, a member and a visitor are told apart", async () => {
+    const who = "export function f(ctx) { return [ctx.member, ctx.owner]; }";
+    expect(await call(who, "f", { member: null, owner: true })).toMatchObject({
+      result: [null, true],
+    });
+    expect(await call(who, "f", { member: null })).toMatchObject({
+      result: [null, false],
+    });
+  });
+
+  test("undefined is null, no arguments are undefined, and only own exports are functions", async () => {
+    expect(await call("export function f() {}", "f")).toMatchObject({ result: null });
+    expect(
+      await call("export function f(ctx, { board } = { board: 'free' }) { return board; }", "f"),
+    ).toMatchObject({ result: "free" });
+    for (const name of ["value", "toString", "constructor", "nope"])
+      expect(await call("export const value = 1;", name)).toMatchObject({
+        ok: false,
+        status: 404,
+      });
+  });
+
+  test("ctx.fail carries the site's code, message and details to the caller", async () => {
+    expect(
+      await call(
+        "export function f(ctx) { ctx.fail('CONFLICT', 'Sold out.', { left: 0 }); }",
+        "f",
+      ),
+    ).toMatchObject({
+      ok: false,
       status: 409,
       code: "CONFLICT",
-      details: { reason: "sold_out" },
+      message: "Sold out.",
+      details: { left: 0 },
+      site: true,
     });
-    expect(failure(`"CONFLICT", "No."`).details).toBeUndefined();
-    expect(failure(`"CONFLICT", "No.", "x".repeat(5000)`).message).toMatch(
-      /4 KiB/,
-    );
-  });
-
-  test("ctx.fail preserves the protocol code and message without invoking storage", () => {
-    expect(() =>
-      run(
-        `export function reject(ctx) { ctx.fail("CONFLICT", "다른 곳에서 수정되었습니다."); }`,
-        "reject",
+    // Caught, it still fails the call.
+    expect(
+      await call(
+        "export function f(ctx) { try { ctx.fail('NOT_FOUND', 'No such post.'); } catch {} return 1; }",
+        "f",
       ),
-    ).toThrow(
-      expect.objectContaining({
-        status: 409,
-        code: "CONFLICT",
-        message: "다른 곳에서 수정되었습니다.",
-        // Written for the page's visitors; SDK 1.1.0 shows it as is.
-        site: true,
-      }),
-    );
-    expect(operations).toEqual([]);
+    ).toMatchObject({ ok: false, status: 404, message: "No such post." });
+    expect(
+      await call("export function f(ctx) { ctx.fail('NOPE', 'x'); }", "f"),
+    ).toMatchObject({ ok: false, status: 400, message: /v1 error code/ });
   });
 
-  test("code that throws is Naru's failure, not a message of the site's", () => {
-    let thrown: unknown;
-    try {
-      run(
-        `export function reject() { throw new Error("sold out"); }`,
-        "reject",
-      );
-    } catch (error) {
-      thrown = error;
-    }
-    expect(thrown).toBeInstanceOf(Error);
-    expect((thrown as { site?: boolean }).site).toBeUndefined();
+  test("code that throws is Naru's 400, which says what it threw", async () => {
+    expect(
+      await call("export function f() { throw new TypeError('sold out'); }", "f"),
+    ).toMatchObject({
+      ok: false,
+      status: 400,
+      message: "Function failed: TypeError: sold out",
+    });
   });
 
-  test("a caught failure is terminal, including in queries", () => {
-    expect(() =>
-      run(
-        `export async function reject(ctx) {
-          try { ctx.fail("ACCESS_DENIED", "No access."); } catch {}
-          try { await ctx.sql("SELECT 1"); } catch {}
-          return { ok: true };
-        }`,
-        "reject",
-        null,
-        "query",
-      ),
-    ).toThrow(expect.objectContaining({ status: 403, code: "ACCESS_DENIED" }));
-    expect(operations).toEqual([]);
+  test("a result over 1 MiB is refused", async () => {
+    expect(
+      await call("export function f() { return 'x'.repeat(1024 * 1024 + 1); }", "f"),
+    ).toMatchObject({ ok: false, message: /larger than 1 MiB/ });
   });
 
-  test.each([
-    ["custom_reason", "No."],
-    ["CONFLICT", ""],
-    ["CONFLICT", "   "],
-    ["CONFLICT", 1],
-    ["CONFLICT", "x".repeat(1001)],
-  ])(
-    "invalid ctx.fail arguments abort even when caught (%s)",
-    (code, message) => {
-      expect(() =>
-        run(
-          `export function reject(ctx, args) {
-      try { ctx.fail(...args); } catch {}
-      return true;
-    }`,
-          "reject",
-          [code, message],
-        ),
-      ).toThrow(expect.objectContaining({ status: 400 }));
-    },
-  );
-
-  test("undefined is null, and only own exports are functions", () => {
-    expect(run("export function nothing() {}", "nothing")).toBeNull();
-    for (const name of ["missing", "toString", "constructor", "__proto__"])
-      expect(() => run("export const value = 1;", name)).toThrow(
-        expect.objectContaining({ status: 404 }),
-      );
-    expect(() => run("export const value = 1;", "value")).toThrow(
-      expect.objectContaining({ status: 404 }),
-    );
+  test("a module that does not parse says so", async () => {
+    expect(await call("export function f( {", "f")).toMatchObject({
+      ok: false,
+      status: 400,
+      message: /does not load/,
+    });
   });
 
-  test("the code's own failures are a 400 that says why, and which retire the instance", async () => {
-    // Each case says whether it leaves the instance in doubt, so retires it.
-    const cases: [string, RegExp, boolean][] = [
-      [
-        "export function f() { throw new Error('sold out'); }",
-        /^Function failed: Error: sold out$/,
-        false,
-      ],
-      [
-        "export function f() { for (;;) {} }",
-        /^Function failed: it ran too long\.$/,
-        true,
-      ],
-      [
-        "export function f() { const a = []; for (;;) a.push('x'.repeat(1e5) + a.length); }",
-        /^Function failed: it used too much memory\.$/,
-        true,
-      ],
-      [
-        "export function f() { const g = () => g(); g(); }",
-        /RangeError/,
-        false,
-      ],
-      [
-        "export async function f() { throw new Error('sold out'); }",
-        /^Function failed: Error: sold out$/,
-        false,
-      ],
-      [
-        "export async function f() { await new Promise(() => {}); }",
-        /never settles/,
-        false,
-      ],
-      [
-        "export async function f() { for (;;) await null; }",
-        /^Function failed: it ran too long\.$/,
-        true,
-      ],
-      // Small async steps each escape the interrupt check; they are counted too.
-      [
-        "export async function f() { for (;;) { for (let i = 0; i < 1000; i++); await null; } }",
-        /^Function failed: it ran too long\.$/,
-        true,
-      ],
-      // Work inside built-ins never reaches an interrupt check; the fuel
-      // meter stops it all the same.
-      [
-        "export function f() { for (;;) JSON.parse('[1,2,3]'); }",
-        /^Function failed: it ran too long\.$/,
-        true,
-      ],
-      [
-        "export function f() { const x = 'a'.repeat(1 << 17); for (;;) x.split('').reverse().join(''); }",
-        /^Function failed: it ran too long\.$/,
-        true,
-      ],
-      [
-        "export function f() { return /(a+)+$/.test('a'.repeat(40) + 'b'); }",
-        /^Function failed: it ran too long\.$/,
-        true,
-      ],
-      ["export function f( {", /does not load/, false],
-      [
-        "export function f() { return 'x'.repeat(1024 * 1024 + 1); }",
-        /1 MiB/,
-        false,
-      ],
-    ];
-    for (const [source, message, retires] of cases) {
-      if (retired.has(module)) module = await engine();
-      let error: DataError | undefined;
-      try {
-        run(source, "f");
-      } catch (caught) {
-        error = caught as DataError;
-      }
-      expect(error).toMatchObject({ status: 400 });
-      expect(error!.message).toMatch(message);
-      expect([source, retired.has(module)]).toEqual([source, retires]);
-    }
-  });
-
-  test("a call spends fuel only within its budget, and a fresh instance runs after one is spent", async () => {
-    const started = performance.now();
-    expect(() =>
-      run("export function f() { for (;;) JSON.parse('[1,2,3]'); }", "f"),
-    ).toThrow(/it ran too long/);
-    // A billion units is a few hundred milliseconds at most.
-    expect(performance.now() - started).toBeLessThan(2000);
-    expect(retired.has(module)).toBe(true);
-    module = await engine();
-    expect(run("export function f() { return 1 + 1; }", "f")).toBe(2);
-    expect(retired.has(module)).toBe(false);
-  });
-
-  test("a query or mutation's ctx holds who calls and sql, and nothing else", () => {
-    const call = (source: string, kind: "query" | "mutation" | "route") =>
-      runFunction(
-        module,
-        {
-          source,
-          name: "f",
-          args: null,
-          member: null,
-          now: 1_700_000_000_000,
-          kind,
-          readonly: kind !== "mutation",
+  test("modules import each other, cycles and re-exports included", async () => {
+    expect(
+      await call("", "buy", {
+        modules: {
+          "mutations/shop/buy.js":
+            "import { price } from '../../modules/prices.js'; export { tax } from '../../modules/tax.js'; export function buy() { return price; }",
+          "modules/prices.js":
+            "import { tax } from './tax.js'; export const price = 10 + tax;",
+          "modules/tax.js":
+            "import { price } from './prices.js'; export const tax = 1; export const later = () => price;",
         },
-        host,
-      );
-    for (const kind of ["query", "route"] as const)
-      expect(
-        call("export function f(ctx) { return Object.keys(ctx); }", kind),
-      ).toEqual([
-        "member",
-        "owner",
-        "ownerName",
-        "now",
-        "fail",
-        "sql",
-        "passwords",
-      ]);
-    // A mutation may notify members too.
-    expect(
-      call("export function f(ctx) { return Object.keys(ctx); }", "mutation"),
-    ).toEqual([
-      "member",
-      "owner",
-      "ownerName",
-      "now",
-      "fail",
-      "sql",
-      "passwords",
-      "notify",
-    ]);
-    // Notifications go out only when something is written.
-    expect(() =>
-      call(
-        "export function f() { return __call('notify', [], { title: 't' }); }",
-        "query",
-      ),
-    ).toThrow(/a query has no ctx.notify/);
-    // Nor reach anything but site SQL, whatever it asks the host.
-    for (const operation of ["get", "add", "publish", "secretMatches"])
-      expect(() =>
-        call(
-          `export function f() { return __call('${operation}', 'posts', '1'); }`,
-          "mutation",
-        ),
-      ).toThrow(new RegExp(`a mutation has no ctx.${operation}`));
-    expect(() =>
-      call("export function f(ctx) { ctx.fail('NOT_FOUND', 'no'); }", "query"),
-    ).toThrow(expect.objectContaining({ status: 404, message: "no" }));
+        entry: "mutations/shop/buy.js",
+      }),
+    ).toMatchObject({ result: 11 });
   });
+});
 
-  test("a query's SQL is read-only whatever its code asks", () => {
-    expect(() =>
-      run(
-        `export async function f(ctx) { await ctx.sql("UPDATE wallets SET balance = ? WHERE id = ?", [1, "m-1"]); }`,
-        "f",
-        null,
-        "query",
-      ),
-    ).toThrow(/only reads/);
-    expect(operations.at(-1)?.[1][2]).toBe(true);
-    expect(wallets.size).toBe(0);
-  });
-
-  test("passwords are hashed by mutations, checked by both, a few a call", () => {
+describe("ctx", () => {
+  test("sql runs in the call's transaction: a later failure rolls it back", async () => {
+    const object = fresh();
     expect(
-      run(
+      await call(
         `export async function f(ctx) {
-          const hash = await ctx.passwords.hash("1234");
-          return [hash, await ctx.passwords.verify("1234", hash, "post-1"), await ctx.passwords.verify("0000", hash, "post-1")];
+          await ctx.sql\`INSERT INTO wallets (id, balance) VALUES (\${"m-1"}, 100)\`;
+          return (await ctx.sql("SELECT balance FROM wallets WHERE id = ?", ["m-1"])).rows;
+        }`,
+        "f",
+        { object },
+      ),
+    ).toMatchObject({ result: [{ balance: 100 }] });
+    expect(
+      await call(
+        `export async function f(ctx) {
+          await ctx.sql("UPDATE wallets SET balance = 0");
+          await null;
+          throw new Error("after the write");
+        }`,
+        "f",
+        { object },
+      ),
+    ).toMatchObject({ ok: false, status: 400 });
+    expect(await wallets(object)).toEqual([{ id: "m-1", balance: 100 }]);
+  });
+
+  test("operations in Promise.all each answer, in order", async () => {
+    expect(
+      await call(
+        `export async function f(ctx) {
+          const answers = await Promise.all([1, 2, 3].map((n) => ctx.sql("SELECT ? AS n", [n])));
+          return answers.map((answer) => answer.rows[0].n);
         }`,
         "f",
       ),
-    ).toEqual(["hash:1234", true, false]);
-    expect(
-      run(
-        "export function f(ctx) { return typeof ctx.passwords.hash; }",
-        "f",
-        null,
-        "query",
-      ),
-    ).toBe("undefined");
-    expect(() =>
-      run(
-        `export async function f(ctx) { for (;;) await ctx.passwords.verify("1", "hash:2", "k"); }`,
-        "f",
-        null,
-        "query",
-      ),
-    ).toThrow(`more than ${MAX_PASSWORD_OPERATIONS} password operations`);
+    ).toMatchObject({ result: [1, 2, 3] });
   });
 
-  test("a call with no arguments gets undefined, so default parameters apply", () => {
+  test("BLOBs are Uint8Arrays both ways", async () => {
     expect(
-      run(
-        "export function f(ctx, { board = 'free' } = {}) { return board; }",
+      await call(
+        `export async function f(ctx) {
+          await ctx.sql("INSERT INTO wallets (id, data) VALUES (?, ?)", ["b", new Uint8Array([0, 1, 255])]);
+          const { rows } = await ctx.sql("SELECT data FROM wallets WHERE id = 'b'");
+          return [rows[0].data instanceof Uint8Array, [...rows[0].data]];
+        }`,
         "f",
+        { object: fresh() },
       ),
-    ).toBe("free");
-    expect(
-      run("export function f(ctx, args) { return args; }", "f", { a: 1 }),
-    ).toEqual({ a: 1 });
+    ).toMatchObject({ result: [true, [0, 1, 255]] });
   });
 
-  test("code can catch its own stack overflow and carry on", () => {
+  test("a query's SQL only reads, whatever its code asks", async () => {
     expect(
-      run(
-        `export function f() {
-          const g = (n) => g(n + 1);
-          try { g(0); } catch (e) { return e.name; }
+      await call(
+        "export function f(ctx) { return ctx.sql('DELETE FROM wallets'); }",
+        "f",
+        { kind: "query" },
+      ),
+    ).toMatchObject({ ok: false, message: "A query's SQL only reads." });
+  });
+
+  test("a failed operation fails the call with the host's error, even if caught", async () => {
+    expect(
+      await call(
+        `export async function f(ctx) {
+          try { await ctx.sql("SELECT * FROM nowhere"); } catch {}
+          return 1;
         }`,
         "f",
       ),
-    ).toBe("RangeError");
+    ).toMatchObject({ ok: false, status: 500 });
+    expect(
+      await call(
+        "export async function f(ctx) { try { await ctx.sql('DELETE FROM wallets'); } catch {} return 1; }",
+        "f",
+        { kind: "query" },
+      ),
+    ).toMatchObject({ ok: false, message: "A query's SQL only reads." });
   });
 
-  test("the guest has URL and URLSearchParams, parsed as the host parses", () => {
+  test("every operation's promise must be used", async () => {
     expect(
-      run(
-        `export function f() {
-          const url = new URL("../b?x=1&y=a+b#top", "https://Example.com:443/a/c");
-          url.searchParams.append("z", "c d");
-          url.searchParams.set("x", "2");
-          const copy = new URL(url);
-          copy.hash = "";
-          copy.pathname = "/other";
-          return {
-            href: url.href,
-            origin: url.origin,
-            host: url.host,
-            y: url.searchParams.get("y"),
-            all: [...new URLSearchParams({ a: 1, b: "x y" })].map((p) => p.join("=")),
-            copy: copy.toString(),
-            json: JSON.stringify({ url }),
-            valid: [URL.canParse("https://x.test"), URL.canParse("nope"), URL.parse("nope")],
-            invalid: (() => { try { new URL("javascript"); } catch (e) { return e.name; } })(),
-          };
-        }`,
+      await call("export function f(ctx) { ctx.sql('SELECT 1'); return 1; }", "f"),
+    ).toMatchObject({ ok: false, message: "Function failed: it did not await ctx.sql." });
+    expect(
+      await call(
+        "export async function f(ctx) { if (!ctx.passwords.verify('a', 'hash:a', 'k')) return 'never'; return 'always'; }",
         "f",
       ),
-    ).toEqual({
-      href: "https://example.com/b?x=2&y=a+b&z=c+d#top",
-      origin: "https://example.com",
-      host: "example.com",
-      y: "a b",
-      all: ["a=1", "b=x y"],
-      copy: "https://example.com/other?x=2&y=a+b&z=c+d",
-      json: '{"url":"https://example.com/b?x=2&y=a+b&z=c+d#top"}',
-      valid: [true, false, null],
-      invalid: "TypeError",
+    ).toMatchObject({ ok: false, message: /did not await ctx.passwordVerify/ });
+  });
+
+  test(`a call makes at most ${MAX_OPERATIONS} operations and ${MAX_PASSWORD_OPERATIONS} password ones`, async () => {
+    const flood = await call(
+      "export async function f(ctx) { for (;;) await ctx.sql('SELECT 1'); }",
+      "f",
+    );
+    expect(flood).toMatchObject({
+      ok: false,
+      message: `Function failed: more than ${MAX_OPERATIONS} database operations.`,
     });
-    expect(() =>
-      run(`export function f() { for (;;) new URL("https://x.test"); }`, "f"),
-    ).toThrow(/more than 1000 URL operations/);
+    expect(flood.operations).toHaveLength(MAX_OPERATIONS);
+    expect(
+      await call(
+        "export async function f(ctx) { for (;;) await ctx.passwords.hash('pw'); }",
+        "f",
+      ),
+    ).toMatchObject({ message: /more than 3 password operations/ });
+    expect(
+      await call(
+        "export async function f(ctx) { return [await ctx.passwords.hash('pw'), await ctx.passwords.verify('pw', 'hash:pw', 'k')]; }",
+        "f",
+      ),
+    ).toMatchObject({ result: ["hash:pw", true] });
   });
 
-  test("the guest sees no fetch, timers, or WebAssembly", () => {
+  test("ctx is frozen", async () => {
     expect(
-      run(
-        `export function f() {
-          return [typeof fetch, typeof setTimeout, typeof WebAssembly, typeof require, typeof process];
+      await call(
+        "export function f(ctx) { 'use strict'; ctx.sql = null; }",
+        "f",
+      ),
+    ).toMatchObject({ ok: false, message: /TypeError/ });
+  });
+});
+
+describe("the isolate", () => {
+  test("has no network, no code from strings, and the platform's URL and structuredClone", async () => {
+    expect(
+      await call(
+        `export async function f() {
+          const out = {};
+          try { await fetch("https://example.com"); out.fetch = "reached"; } catch (e) { out.fetch = "refused"; }
+          try { eval("1"); out.eval = "ran"; } catch { out.eval = "refused"; }
+          const url = new URL("/a?b=1", "https://naru.pub");
+          out.url = [url.href, url.searchParams.get("b")];
+          out.clone = structuredClone({ d: new Map([[1, 2]]) }).d.get(1);
+          out.console = console.log("quiet") === undefined;
+          return out;
         }`,
         "f",
       ),
-    ).toEqual([
-      "undefined",
-      "undefined",
-      "undefined",
-      "undefined",
-      "undefined",
-    ]);
+    ).toMatchObject({
+      result: {
+        fetch: "refused",
+        eval: "refused",
+        url: ["https://naru.pub/a?b=1", "1"],
+        clone: 2,
+        console: true,
+      },
+    });
   });
 
-  // What docs/sdk-v1-api.md ("The runtime's globals") and functions.d.ts
-  // list: QuickJS's own, plus URL, URLSearchParams and structuredClone from
-  // the prelude (Naru's `__` names aside).
-  test("the guest's globals are the documented set", () => {
-    const globals = run(
-      `export function f() {
-        return Object.getOwnPropertyNames(globalThis).filter((name) => !name.startsWith("__")).sort();
+  test("code awaiting what never settles fails, and so does a call past its time", async () => {
+    expect(
+      await call("export async function f() { await new Promise(() => {}); }", "f"),
+    ).toMatchObject({ ok: false, status: 400 });
+    const object = fresh();
+    const late = await call(
+      `export async function f(ctx) {
+        await new Promise((resolve) => setTimeout(resolve, ${CALL_TIME_MS + 500}));
+        await ctx.sql("INSERT INTO wallets (id, balance) VALUES ('late', 1)");
       }`,
       "f",
-      null,
-      "query",
+      { object },
     );
-    expect(globals).toEqual(
+    expect(late).toMatchObject({ ok: false, message: "Function failed: it ran too long." });
+    // Its ctx answers nothing once the call has ended.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    expect(await wallets(object)).toEqual([]);
+  });
+
+  test.runIf(naru)("Naru's workerd stops code past its CPU or memory", async () => {
+    const object = fresh();
+    for (const [source, message] of [
+      ["export function f() { for (;;) {} }", "it ran too long."],
+      ["export async function f() { for (;;) await null; }", "it ran too long."],
+      ["export function f() { return /(a+)+$/.test('a'.repeat(40) + 'b'); }", "it ran too long."],
       [
-        // Values and functions
-        "globalThis",
-        "undefined",
-        "NaN",
-        "Infinity",
-        "eval",
-        "isFinite",
-        "isNaN",
-        "parseFloat",
-        "parseInt",
-        "decodeURI",
-        "decodeURIComponent",
-        "encodeURI",
-        "encodeURIComponent",
-        "escape",
-        "unescape",
-        "queueMicrotask",
-        "structuredClone",
-        // Objects and constructors
-        "Object",
-        "Function",
-        "Array",
-        "Number",
-        "Boolean",
-        "String",
-        "Symbol",
-        "BigInt",
-        "Date",
-        "RegExp",
-        "JSON",
-        "Math",
-        "Reflect",
-        "Proxy",
-        "Promise",
-        "Map",
-        "Set",
-        "WeakMap",
-        "WeakSet",
-        "WeakRef",
-        "FinalizationRegistry",
-        "Iterator",
-        "ArrayBuffer",
-        "SharedArrayBuffer",
-        "DataView",
-        "Int8Array",
-        "Uint8Array",
-        "Uint8ClampedArray",
-        "Int16Array",
-        "Uint16Array",
-        "Int32Array",
-        "Uint32Array",
-        "BigInt64Array",
-        "BigUint64Array",
-        "Float16Array",
-        "Float32Array",
-        "Float64Array",
-        "Error",
-        "AggregateError",
-        "EvalError",
-        "InternalError",
-        "RangeError",
-        "ReferenceError",
-        "SyntaxError",
-        "TypeError",
-        "URIError",
-        "DOMException",
-        "performance",
-        "URL",
-        "URLSearchParams",
-      ].sort(),
-    );
-    // And what pages have that this does not.
-    expect(
-      run(
-        `export function f() {
-          return [typeof Intl, typeof TextEncoder, typeof TextDecoder, typeof crypto, typeof atob, typeof btoa, typeof console, typeof setTimeout, typeof performance.now, typeof Date.now()];
-        }`,
-        "f",
-        null,
-        "query",
-      ),
-    ).toEqual([
-      "undefined",
-      "undefined",
-      "undefined",
-      "undefined",
-      "undefined",
-      "undefined",
-      "undefined",
-      "undefined",
-      "function",
-      "number",
-    ]);
-  });
-
-  test("structuredClone copies plain data, Dates, Maps, Sets and bytes, and refuses the rest", () => {
-    expect(
-      run(
-        `export function f() {
-          const shared = { n: 1 };
-          const from = {
-            list: [1, "two", null, shared, shared],
-            when: new Date(5),
-            map: new Map([["k", new Set([1, 2])]]),
-            bytes: new Uint8Array([1, 2, 3]),
-            pattern: /a+/gi,
-          };
-          from.self = from;
-          const to = structuredClone(from);
-          to.list[3].n = 2;
-          to.bytes[0] = 9;
-          const refused = [() => 1, Symbol("s"), new (class Thing {})(), new Int16Array(1)].map((value) => {
-            try { structuredClone(value); return "cloned"; } catch (error) { return error.name; }
-          });
-          return {
-            copied: to !== from && to.self === to && to.list[3] === to.list[4],
-            untouched: [shared.n, from.bytes[0]],
-            when: to.when instanceof Date && to.when.getTime(),
-            map: [...to.map.get("k")],
-            bytes: to.bytes instanceof Uint8Array && [...to.bytes],
-            pattern: String(to.pattern),
-            refused,
-          };
-        }`,
-        "f",
-        null,
-        "query",
-      ),
-    ).toEqual({
-      copied: true,
-      untouched: [1, 1],
-      when: 5,
-      map: [1, 2],
-      bytes: [9, 2, 3],
-      pattern: "/a+/gi",
-      refused: Array(4).fill("DataCloneError"),
-    });
-  });
-});
-
-describe("the host", () => {
-  test("a failed ctx operation fails the call with the host's error, even if caught", () => {
-    expect(() =>
-      run(
-        `export async function f(ctx) {
-          try { await ctx.sql("INSERT INTO full VALUES (1)"); } catch {}
-          return "carried on";
-        }`,
-        "f",
-      ),
-    ).toThrow(expect.objectContaining({ code: "QUOTA_EXCEEDED", status: 409 }));
-  });
-
-  test("every ctx result must be used, or the call fails", () => {
-    const failure = (body: string) => {
-      try {
-        run(`export async function f(ctx) { ${body} }`, "f");
-      } catch (error) {
-        return (error as DataError).message;
-      }
-      return null;
-    };
-    expect(failure(`ctx.sql("SELECT 1"); return 1;`)).toBe(
-      "Function failed: it did not await ctx.sql.",
-    );
-    // The host's own failure explains more than the missing await.
-    expect(() =>
-      run(
-        `export function f(ctx) { ctx.sql("INSERT INTO full VALUES (1)"); }`,
-        "f",
-      ),
-    ).toThrow(expect.objectContaining({ code: "QUOTA_EXCEEDED" }));
-    // Awaiting, returning, chaining and Promise.all all count as use.
-    for (const body of [
-      `await ctx.sql("SELECT 1");`,
-      `return ctx.sql("SELECT 1");`,
-      `return ctx.sql("SELECT 1").then((result) => result.rows);`,
-      `await ctx.sql("SELECT 1").catch(() => null);`,
-      `await Promise.all([ctx.sql("SELECT 1"), ctx.sql("SELECT 2")]);`,
-      `const [a] = await Promise.allSettled([ctx.sql("SELECT 1")]); return a.status;`,
+        "export async function f(ctx) { await ctx.sql(\"INSERT INTO wallets (id, balance) VALUES ('x', 1)\"); for (;;) {} }",
+        "it ran too long.",
+      ],
     ])
-      expect(failure(body)).toBeNull();
-    expect(
-      run(
-        `export function f(ctx) { const p = ctx.sql("SELECT 1"); return [p instanceof Promise, p.then(() => 1) instanceof Promise]; }`,
-        "f",
-      ),
-    ).toEqual([true, true]);
-  });
-
-  test("operations are counted, since the interrupt checks cannot see them", () => {
-    expect(() =>
-      run(
-        `export async function f(ctx) { for (let i = 0; ; i++) await ctx.sql("SELECT 1"); }`,
-        "f",
-      ),
-    ).toThrow(`more than ${MAX_OPERATIONS} database operations`);
-    expect(operations.length).toBe(MAX_OPERATIONS);
-    operations = [];
-    // Within the limits, everything goes through.
-    expect(
-      run(
-        `export async function f(ctx) {
-          for (let i = 0; i < ${MAX_OPERATIONS - 1}; i++)
-            await ctx.sql("UPDATE wallets SET balance = ? WHERE id = ?", [i, "m-1"]);
-          return (await ctx.sql\`SELECT balance FROM wallets WHERE id = \${"m-1"}\`).rows;
-        }`,
-        "f",
-      ),
-    ).toEqual([{ balance: MAX_OPERATIONS - 2 }]);
-  });
-
-  test("Math.random() draws have their own cap, apart from database operations", () => {
-    // A row ID made in JavaScript takes many draws; they leave the call's
-    // database operations untouched.
-    expect(
-      run(
-        `export async function f(ctx) {
-          let sum = 0;
-          for (let i = 0; i < ${MAX_RANDOM_DRAWS}; i++) sum += Math.random();
-          for (let i = 0; i < ${MAX_OPERATIONS}; i++) await ctx.sql("SELECT 1");
-          return sum;
-        }`,
-        "f",
-      ),
-    ).toBe(MAX_RANDOM_DRAWS * 0.5);
-    expect(() =>
-      run(`export function f() { for (;;) Math.random(); }`, "f"),
-    ).toThrow(`more than ${MAX_RANDOM_DRAWS} Math.random() draws`);
-  });
-
-  test("ctx is frozen, and nothing outlives a call", () => {
-    expect(
-      run(
-        `export function f(ctx) { "use strict"; try { ctx.sql = null; } catch (e) { return e.name; } }`,
-        "f",
-      ),
-    ).toBe("TypeError");
-    const counter = `let n = 0; export function f() { globalThis.seen = (globalThis.seen ?? 0) + 1; return [++n, globalThis.seen]; }`;
-    expect(run(counter, "f")).toEqual([1, 1]);
-    expect(run(counter, "f")).toEqual([1, 1]);
-  });
-});
-
-test("preloaded imports execute through the same ctx and read-only guard", () => {
-  const filename = "mutations/shop.js";
-  const source =
-    'import { act } from "../modules/wallet.js"; export function buy(ctx) { return act(ctx); }';
-  const modules = {
-    [filename]: source,
-    "modules/wallet.js":
-      'export async function act(ctx) { await ctx.sql("UPDATE wallets SET balance = ? WHERE id = ?", [10, "one"]); return 1; }',
-  };
-  const invoke = (kind: "query" | "mutation") =>
-    runFunction(
-      module,
-      {
-        source,
-        filename,
-        modules,
-        name: "buy",
-        args: null,
-        member: "m-1",
-        now: 0,
-        kind,
-        readonly: kind === "query",
-      },
-      host,
-    );
-  expect(() => invoke("query")).toThrow(/only reads/);
-  expect(wallets.size).toBe(0);
-  expect(invoke("mutation")).toBe(1);
-  expect(wallets.get("one")).toBe(10);
-});
-
-test("native cycles and re-exports retain live bindings, fresh for each call", () => {
-  const filename = "queries/cycle.js";
-  const source = 'export { read } from "../modules/a.js";';
-  const modules = {
-    [filename]: source,
-    "modules/a.js":
-      'import { increment } from "./b.js"; export let value = 1; export function read() { increment(); return value; } export function update() { value++; }',
-    "modules/b.js":
-      'import { update } from "./a.js"; export function increment() { update(); }',
-  };
-  const invoke = () =>
-    runFunction(
-      module,
-      {
-        source,
-        filename,
-        modules,
-        name: "read",
-        args: null,
-        member: null,
-        now: 0,
-        kind: "query",
-        readonly: true,
-      },
-      host,
-    );
-  expect(invoke()).toBe(2);
-  expect(invoke()).toBe(2);
-});
-
-describe("ctx's owner name", () => {
-  const call = (
-    source: string,
-    kind: Invocation["kind"],
-    extra: Partial<Invocation> = {},
-  ) =>
-    runFunction(
-      module,
-      {
-        source,
-        name: "f",
-        args: null,
-        member: "m-1",
-        now: 1,
-        kind,
-        readonly: kind !== "mutation",
-        ...extra,
-      },
-      host,
-    );
-
-  test("site code has the owner's name", () => {
-    expect(
-      call(
-        "export function f(ctx) { return { owner: ctx.ownerName, media: ctx.media }; }",
-        "query",
-        { ownerName: "avocado" },
-      ),
-    ).toEqual({ owner: "avocado" });
+      expect(await call(source, "f", { object })).toMatchObject({
+        ok: false,
+        message: `Function failed: ${message}`,
+      });
+    expect(await wallets(object)).toEqual([]);
+    expect(await call("export function f() { return 1; }", "f")).toMatchObject({
+      result: 1,
+    });
   });
 });

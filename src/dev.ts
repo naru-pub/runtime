@@ -6,7 +6,7 @@ import {
   type OperationsEnv,
 } from "./operations";
 import { serveSdk, type SdkEnv } from "./sdk";
-import { SiteData as RuntimeSiteData } from "./site";
+import { SiteData as RuntimeSiteData, type SiteDataEnv } from "./site";
 import { dataApi, type WebsiteEnv } from "./website";
 
 // The runtime as naru-dev runs it, under workerd on the developer's machine
@@ -20,7 +20,8 @@ import { dataApi, type WebsiteEnv } from "./website";
 type DevEnv = OperationsEnv &
   SdkEnv &
   WebsiteEnv &
-  HttpBucketEnv & {
+  HttpBucketEnv &
+  Pick<SiteDataEnv, "LOADER"> & {
     PLATFORM_DOMAIN: string;
     EDGE_WORKER_SECRET: string;
   };

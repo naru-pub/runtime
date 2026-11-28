@@ -102,6 +102,9 @@ ${modules.join("\n")}
   ],
   bindings = [
     (name = "SITES", durableObjectNamespace = "SiteData"),
+    # Each release of a site's code in an isolate of its own (src/functions.ts).
+    # Worker Loader bindings need workerd's --experimental.
+    (name = "LOADER", workerLoader = (id = "sites")),
     (name = "SDK_FILES", service = "sdk-files"),
     (name = "PLATFORM_DOMAIN", text = "naru.pub"),
     (name = "SITE_MONTHLY_REQUESTS", text = "20000000"),
