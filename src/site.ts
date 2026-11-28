@@ -103,7 +103,7 @@ type Migration = { name: string; sql: string; digest: string };
  * configuration, the month's budget and counts, and the active release.
  */
 const PRESENT_META =
-  /^(owner_id|entitled_until|confirmed_until|monthly_requests|rows_per_minute|budget_month|budget_used|functions_revision|functions_generation|stats:.*)$/;
+  /^(owner_id|entitled_until|confirmed_until|monthly_requests|rows_per_minute|call_ms_per_minute|budget_month|budget_used|functions_revision|functions_generation|stats:.*)$/;
 
 /** A value for a dump, which is JSON: a BLOB becomes { $base64 }. */
 const toDump = (value: SqlValue): DumpValue =>
@@ -281,6 +281,7 @@ const publicWritesSpent = (window: number) =>
 type Limit =
   | "budget"
   | "rows"
+  | "time"
   | "reads"
   | "public_writes"
   | "member_calls"
@@ -310,10 +311,25 @@ const VISITOR_CALLS = { address: 60, site: 600 };
  * The owner is never refused.
  */
 const ROWS_PER_MINUTE = 5_000_000;
+/**
+ * Time a minute the site's code may take for its members and visitors: each
+ * call from start to answer, the site code's CPU and its ctx operations
+ * alike (6 s, a tenth of the shard's one thread). Rows a minute misses code
+ * that works without reading: 600 calls of 50 ms CPU each read nothing and
+ * take half the thread. A call's time includes what other sites ran while
+ * it waited, so the limit bites sooner on a busy shard, which is when it
+ * matters. The owner is never refused.
+ */
+const CALL_MS_PER_MINUTE = 6_000;
 // Counted by calendar minute (thisMinute), so it lifts at the next one.
 const busy = () =>
   rateLimited(
     "This site has read as much as it may this minute. Try again next minute.",
+    untilNextMinute(),
+  );
+const overtime = () =>
+  rateLimited(
+    "This site's code has run as long as it may this minute. Try again next minute.",
     untilNextMinute(),
   );
 /** Reads a minute by one address or member; see limitReader. */
@@ -949,14 +965,23 @@ export class SiteData extends DurableObject<SiteDataEnv> {
 
   /** Every row SQLite has read through `rows`, and this minute's share for members and visitors. */
   private rowsRead = 0;
-  private worked = { minute: 0, rows: 0 };
+  private worked = { minute: 0, rows: 0, ms: 0 };
   private thisMinute() {
     const minute = Math.floor(Date.now() / 60000);
     if (this.worked.minute !== minute) {
       this.foldMinute(this.worked);
-      this.worked = { minute, rows: 0 };
+      this.worked = { minute, rows: 0, ms: 0 };
     }
     return this.worked;
+  }
+  private callMsPerMinute() {
+    const own = this.meta("call_ms_per_minute");
+    if (own !== null) return Number(own);
+    const configured = Number(
+      (this.env as { SITE_CALL_MS_PER_MINUTE?: string })
+        .SITE_CALL_MS_PER_MINUTE,
+    );
+    return configured > 0 ? configured : CALL_MS_PER_MINUTE;
   }
   private rowsPerMinute() {
     const own = this.meta("rows_per_minute");
@@ -970,6 +995,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   private admitWork() {
     if (this.thisMinute().rows >= this.rowsPerMinute())
       throw marked("rows", busy());
+    if (this.thisMinute().ms >= this.callMsPerMinute())
+      throw marked("time", overtime());
   }
   /** Runs a member's or visitor's work, counting the rows it read. */
   private metered<T>(work: () => T): T {
@@ -983,15 +1010,24 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     }
   }
 
-  /** `metered` for work that awaits; no other request runs meanwhile (transact). */
+  /**
+   * `metered` for a call of site code, which awaits (no other request of
+   * this site runs meanwhile: transact): its rows, and its time from start to
+   * answer, against the site's minute (CALL_MS_PER_MINUTE).
+   */
   private async meteredAsync<T>(work: () => Promise<T>): Promise<T> {
     const before = this.rowsRead;
+    const started = performance.now();
     try {
       return await work();
     } finally {
       const rows = this.rowsRead - before;
-      this.thisMinute().rows += rows;
+      const ms = Math.max(0, Math.round(performance.now() - started));
+      const minute = this.thisMinute();
+      minute.rows += rows;
+      minute.ms += ms;
       this.tally("rows", rows);
+      this.tally("call_ms", ms);
     }
   }
 
@@ -1441,6 +1477,13 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         this.setMeta(
           "rows_per_minute",
           input.rowsPerMinute === null ? null : String(input.rowsPerMinute),
+        );
+      if (input.callMsPerMinute !== undefined)
+        this.setMeta(
+          "call_ms_per_minute",
+          input.callMsPerMinute === null
+            ? null
+            : String(input.callMsPerMinute),
         );
       return { ...this.usage(), requests: this.requestsThisMonth() };
     });

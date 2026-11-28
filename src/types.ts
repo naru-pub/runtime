@@ -145,6 +145,8 @@ export type EdgeConfiguration = {
   monthlyRequests?: number | null;
   /** Rows a minute other than the Worker's default; null restores it. */
   rowsPerMinute?: number | null;
+  /** Site code's time a minute (ms) other than the default; null restores it. */
+  callMsPerMinute?: number | null;
 };
 
 export type Usage = { documents: number; bytes: number };
