@@ -165,6 +165,23 @@ const OWNER_QUERIES_PER_MINUTE = 30;
 /** A dump's snapshot tables (`openDump`) and a restore's staging tables (`stage`). */
 const SNAP = "_naru_snap_";
 const STAGE = "_naru_stage_";
+/**
+ * A snapshot copies a table SNAPSHOT_SLICE_ROWS rows at a time, in slices of
+ * about SNAPSHOT_SLICE_MS, yielding the thread between slices (openDump). It
+ * gives up past SNAPSHOT_DEADLINE_MS, well before blockConcurrencyWhile's 30
+ * seconds would reset the object.
+ */
+const SNAPSHOT_SLICE_ROWS = 1000;
+const SNAPSHOT_SLICE_MS = 10;
+const SNAPSHOT_DEADLINE_MS = 20_000;
+/** A snapshot table, what it copies, and the key it copies in order of. */
+interface SnapshotTable {
+  table: string;
+  snap: string;
+  from: string;
+  select: string;
+  key: string[] | null;
+}
 /** Rows a dump reads from its snapshot at a time. */
 const DUMP_PAGE_ROWS = 500;
 /** Characters of lines a dump collects before handing them on. */
@@ -2656,11 +2673,17 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   }
 
   /**
-   * Tests only: the snapshot and staging tables that are left, and how long
-   * the last dump's snapshot took. `failUpload` first writes a dump to a
-   * bucket that refuses its parts, as R2 failing midway would.
+   * Tests only: the snapshot and staging tables that are left, how long the
+   * last dump's snapshot froze the site and its longest slice took.
+   * `failUpload` first writes a dump to a bucket that refuses its parts, as
+   * R2 failing midway would; `snapshotDeadlineMs` sets how long the next
+   * snapshots may take.
    */
-  async internalTables(input: { failUpload?: boolean } = {}) {
+  async internalTables(
+    input: { failUpload?: boolean; snapshotDeadlineMs?: number } = {},
+  ) {
+    if (typeof input?.snapshotDeadlineMs === "number")
+      this.snapshotDeadlineMs = input.snapshotDeadlineMs;
     let failed: string | null = null;
     if (input?.failUpload) {
       const refuse = async () => {
@@ -2686,6 +2709,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         "SELECT name FROM sqlite_master WHERE type = 'table' AND (substr(name, 1, 11) = '_naru_snap_' OR substr(name, 1, 12) = '_naru_stage_') ORDER BY name",
       ).map((row) => String(row.name)),
       snapshotMs: this.lastSnapshotMs,
+      longestSliceMs: this.longestSliceMs,
       failed,
       temporaryBytes: this.snapshotBytes + this.stagedBytes,
     }));
@@ -3096,18 +3120,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           return { revision: this.meta("functions_revision"), saved, rows };
         };
         // Nothing else runs from the save to the replacement, so the restore
-        // point of the present misses no write the restore replaces. A
-        // callback that throws would reset the object: a refusal comes out
-        // as a value, and is thrown again here.
-        const done = await this.ctx.blockConcurrencyWhile(async () => {
-          try {
-            return { value: await restoring() };
-          } catch (error) {
-            return { error };
-          }
-        });
-        if ("error" in done) throw done.error;
-        return done.value;
+        // point of the present misses no write the restore replaces.
+        return this.frozen(restoring);
       }),
     );
     if (outcome.ok) await this.pruneRestorePoints(input.site);
@@ -3193,7 +3207,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     return this.settle(async () => {
       const release = await this.acquire();
       try {
-        const dump = this.openDump();
+        const dump = await this.openDump();
         return dumpStream(dump.bytes, () => {
           dump.close();
           release();
@@ -3232,8 +3246,9 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   }
 
   // Dumps and restores, a part at a time (dump.ts, dump-format.ts). A dump
-  // copies every table it carries into `_naru_snap_<n>` in one synchronous
-  // step, its snapshot, and is then written from those a page at a time; a
+  // copies every table it carries into `_naru_snap_<n>`, its snapshot, with
+  // the site frozen and the thread yielded between slices, and is then
+  // written from those a page at a time; a
   // restore reads rows into `_naru_stage_<n>` in short transactions, and
   // swaps them in at the end in one. Both are `_naru…` names, which site SQL
   // cannot use and dumps and listings leave out. One runs at a time in an
@@ -3288,37 +3303,73 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   }
 
   /**
-   * The snapshot: every table a dump carries, copied in one transaction,
-   * with the schema to create the site's tables again. Then `bytes` reads it
-   * a page at a time; `close` drops it, however the dump ended.
+   * `work` with the site frozen: no request, alarm or message of this object
+   * runs until it ends (blockConcurrencyWhile), though other objects on the
+   * thread do whenever it awaits. Nested, it runs as it is. A callback that
+   * throws would reset the object, so a refusal comes out as a value and is
+   * thrown again here.
    */
-  private openDump() {
+  private async frozen<T>(work: () => Promise<T>): Promise<T> {
+    if (this.freezing) return work();
+    const done = await this.ctx.blockConcurrencyWhile(async () => {
+      this.freezing = true;
+      try {
+        return { value: await work() };
+      } catch (error) {
+        return { error };
+      } finally {
+        this.freezing = false;
+      }
+    });
+    if ("error" in done) throw done.error;
+    return done.value;
+  }
+  private freezing = false;
+
+  /**
+   * The snapshot: every table a dump carries, copied with the schema to
+   * create the site's tables again. The site is frozen for the copy, which
+   * goes in slices of about SNAPSHOT_SLICE_MS, each its own transaction,
+   * yielding the thread between them, so the shard's other sites wait at
+   * most a slice, not the whole copy. Then `bytes` reads it a page at a
+   * time, the site no longer frozen; `close` drops it, however the dump
+   * ended.
+   */
+  private async openDump() {
     this.dropInternal(SNAP);
     const started = Date.now();
     const before = this.sql.databaseSize;
-    const snapshot = this.ctx.storage.transactionSync(() => {
-      const objects = this.siteObjects();
-      const sources = [
-        ...DUMP_TABLES.map((table) => ({ table, from: table, virtual: false })),
-        ...objects
-          .filter((object) => object.type === "table")
-          .map((object) => ({
-            table: `${SITE_TABLE_PREFIX}${object.name}`,
-            from: quoteName(object.name),
-            virtual: object.virtual,
-          })),
-        { table: "_naru_migrations", from: "_naru_migrations", virtual: false },
-      ];
-      const tables = sources.map((source, n) => {
-        const snap = `${SNAP}${n}`;
-        // A full-text table's rowid is not one of its columns: it is kept as
-        // one, under that name, as restore expects it.
-        this.sql.exec(
-          `CREATE TABLE ${snap} AS SELECT ${source.virtual ? "rowid AS rowid, " : ""}* FROM ${source.from}`,
-        );
-        return { table: source.table, snap };
-      });
-      return { schema: objects.map((object) => object.sql), tables };
+    this.longestSliceMs = 0;
+    const snapshot = await this.frozen(async () => {
+      const plan = this.ctx.storage.transactionSync(() => this.snapshotPlan());
+      const deadline = started + this.snapshotDeadlineMs;
+      try {
+        for (const table of plan.tables) {
+          let after: SqlValue[] | null = null;
+          for (;;) {
+            const sliceStarted = performance.now();
+            after = this.ctx.storage.transactionSync(() =>
+              this.copySlice(table, after, sliceStarted),
+            );
+            this.longestSliceMs = Math.max(
+              this.longestSliceMs,
+              performance.now() - sliceStarted,
+            );
+            if (after === null) break;
+            if (Date.now() > deadline)
+              throw new DataError(
+                503,
+                "The site's database took too long to copy for a dump. Try again later.",
+              );
+            // The shard's other sites run here.
+            await scheduler.wait(0);
+          }
+        }
+      } catch (error) {
+        this.dropInternal(SNAP);
+        throw error;
+      }
+      return plan;
     });
     this.lastSnapshotMs = Date.now() - started;
     this.snapshotBytes = Math.max(0, this.sql.databaseSize - before);
@@ -3336,20 +3387,25 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           .exec(`SELECT name FROM pragma_table_info('${snap}')`)
           .toArray()
           .map((column) => String(column.name));
-        // The snapshot's own rowid, by a name none of its columns has.
+        // The snapshot's own rowid, by a name none of its columns has. A
+        // table whose columns have all three is read by offset instead.
         const key = ["_rowid_", "oid", "rowid"].find(
           (name) => !columns.some((column) => column.toLowerCase() === name),
-        )!;
+        );
         let after = 0;
-        for (;;) {
+        for (let offset = 0; ; offset += DUMP_PAGE_ROWS) {
           // A page at a time, read whole: no cursor is open across an await.
           const cursor = [
-            ...sql
-              .exec(
-                `SELECT ${key}, * FROM ${snap} WHERE ${key} > ? ORDER BY ${key} LIMIT ${DUMP_PAGE_ROWS}`,
-                after,
-              )
-              .raw(),
+            ...(key
+              ? sql.exec(
+                  `SELECT ${key}, * FROM ${snap} WHERE ${key} > ? ORDER BY ${key} LIMIT ${DUMP_PAGE_ROWS}`,
+                  after,
+                )
+              : sql.exec(
+                  `SELECT NULL, * FROM ${snap} LIMIT ${DUMP_PAGE_ROWS} OFFSET ?`,
+                  offset,
+                )
+            ).raw(),
           ];
           for (const values of cursor) {
             after = Number(values[0]);
@@ -3374,8 +3430,114 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       },
     };
   }
-  /** How long the last dump's snapshot held the object, in ms (tests). */
+  /**
+   * What a snapshot copies, read in one transaction: the site's schema, and
+   * each table it carries with its snapshot table (made empty here) and the
+   * key it is copied in order of. No DDL runs while the site is frozen, so
+   * the plan holds for the whole copy.
+   */
+  private snapshotPlan() {
+    const objects = this.siteObjects();
+    const sources = [
+      ...DUMP_TABLES.map((table) => ({ table, name: table, virtual: false })),
+      ...objects
+        .filter((object) => object.type === "table")
+        .map((object) => ({
+          table: `${SITE_TABLE_PREFIX}${object.name}`,
+          name: object.name,
+          virtual: object.virtual,
+        })),
+      { table: "_naru_migrations", name: "_naru_migrations", virtual: false },
+    ];
+    const tables: SnapshotTable[] = sources.map((source, n) => {
+      const snap = `${SNAP}${n}`;
+      const from = quoteName(source.name);
+      // A full-text table's rowid is not one of its columns: it is kept as
+      // one, under that name, as restore expects it.
+      const select = `SELECT ${source.virtual ? "rowid AS rowid, " : ""}* FROM ${from}`;
+      this.sql.exec(`CREATE TABLE ${snap} AS ${select} WHERE 0`);
+      return { table: source.table, snap, from, select, key: this.copyKey(source) };
+    });
+    return { schema: objects.map((object) => object.sql), tables };
+  }
+
+  /**
+   * The columns a table is copied in order of, quoted: its rowid, by a name
+   * none of its columns has, or a WITHOUT ROWID table's primary key. Null
+   * when there is neither (every rowid name is a column's): it is copied in
+   * one step.
+   */
+  private copyKey(source: { name: string; virtual: boolean }): string[] | null {
+    if (source.virtual) return ["rowid"];
+    const columns = this.sql
+      .exec(
+        "SELECT name, pk FROM pragma_table_info(?) ORDER BY pk",
+        source.name,
+      )
+      .toArray();
+    const withoutRowid = this.sql
+      .exec("SELECT wr FROM pragma_table_list(?)", source.name)
+      .toArray()
+      .some((row) => Number(row.wr) === 1);
+    if (withoutRowid)
+      return columns
+        .filter((column) => Number(column.pk) > 0)
+        .map((column) => quoteName(String(column.name)));
+    const rowid = ["_rowid_", "oid", "rowid"].find(
+      (name) =>
+        !columns.some((column) => String(column.name).toLowerCase() === name),
+    );
+    return rowid ? [rowid] : null;
+  }
+
+  /**
+   * Copies `table`'s rows after the key `after` (null: from the start) into
+   * its snapshot table, SNAPSHOT_SLICE_ROWS at a time, until the slice has
+   * run SNAPSHOT_SLICE_MS since `started`. Returns the last key copied, or
+   * null when the table is done. Each step finds its last key first, an
+   * index-only read, and copies up to it, so no row is copied twice.
+   */
+  private copySlice(
+    table: SnapshotTable,
+    after: SqlValue[] | null,
+    started: number,
+  ): SqlValue[] | null {
+    if (!table.key) {
+      this.sql.exec(`INSERT INTO ${table.snap} ${table.select}`);
+      return null;
+    }
+    const key = `(${table.key.join(", ")})`;
+    const values = (count: number) =>
+      `(${Array.from({ length: count }, () => "?").join(", ")})`;
+    for (;;) {
+      const from = after === null ? [] : [`${key} > ${values(after.length)}`];
+      const bound =
+        [
+          ...this.sql
+            .exec(
+              `SELECT ${table.key.join(", ")} FROM ${table.from}${from.length ? ` WHERE ${from[0]}` : ""} ORDER BY ${table.key.join(", ")} LIMIT 1 OFFSET ${SNAPSHOT_SLICE_ROWS - 1}`,
+              ...(after ?? []),
+            )
+            .raw(),
+        ][0] ?? null;
+      const range = bound === null ? from : [...from, `${key} <= ${values(bound.length)}`];
+      this.sql.exec(
+        `INSERT INTO ${table.snap} ${table.select}${range.length ? ` WHERE ${range.join(" AND ")}` : ""} ORDER BY ${table.key.join(", ")}`,
+        ...(after ?? []),
+        ...(bound ?? []),
+      );
+      if (bound === null) return null;
+      after = bound as SqlValue[];
+      if (performance.now() - started >= SNAPSHOT_SLICE_MS) return after;
+    }
+  }
+
+  /** How long the last dump's snapshot froze the site, in ms (tests). */
   private lastSnapshotMs = 0;
+  /** Its longest slice: how long the shard's other sites waited at most (tests). */
+  private longestSliceMs = 0;
+  /** How long a snapshot may take before it gives up (tests set it lower). */
+  private snapshotDeadlineMs = SNAPSHOT_DEADLINE_MS;
   /**
    * About how much of the database the open dump's snapshot and the
    * restore's staging tables take, which the site's quota leaves out.
@@ -3393,7 +3555,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     key: string,
     bucket: DumpBucket = this.env.PRIVATE_FILES,
   ) {
-    const dump = this.openDump();
+    const dump = await this.openDump();
     try {
       return await uploadDump(
         bucket,
