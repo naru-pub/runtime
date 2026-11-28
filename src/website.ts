@@ -48,6 +48,11 @@ export interface WebsiteEnv {
    */
   PASSTHROUGH_ORIGIN?: string;
   /**
+   * How requests for PASSTHROUGH_ORIGIN go, where the Worker's own fetch may
+   * not reach it: on the mini, whose shards reach only the internet.
+   */
+  PASSTHROUGH?: Fetcher;
+  /**
    * "off" where there is no edge cache (workerd on the mini): visitors' reads
    * are then answered by the object each time, which is local there.
    */
@@ -163,12 +168,11 @@ async function visit(
 function passThrough(request: Request, env: WebsiteEnv) {
   if (!env.PASSTHROUGH_ORIGIN) return fetch(request);
   const url = new URL(request.url);
-  return fetch(
-    new Request(
-      new URL(url.pathname + url.search, env.PASSTHROUGH_ORIGIN),
-      request,
-    ),
+  const onward = new Request(
+    new URL(url.pathname + url.search, env.PASSTHROUGH_ORIGIN),
+    request,
   );
+  return env.PASSTHROUGH ? env.PASSTHROUGH.fetch(onward) : fetch(onward);
 }
 
 const ROUTE = /^\/api\/data\/v1\/([^/]+)(?:\/(.*))?$/;

@@ -122,6 +122,10 @@ export function workerCode(
 ): WorkerCode {
   return {
     compatibilityDate: "2026-10-01",
+    // Node compatibility is on by default since 2026-08-04: process,
+    // node:* modules. Site code needs none of it, and each API is more
+    // surface for a V8 or runtime bug.
+    compatibilityFlags: ["no_nodejs_compat", "no_nodejs_compat_v2"],
     mainModule: ENTRY_MODULE,
     modules: {
       ...Object.fromEntries(

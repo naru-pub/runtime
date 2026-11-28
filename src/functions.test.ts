@@ -421,6 +421,9 @@ describe("the isolate", () => {
           out.url = [url.href, url.searchParams.get("b")];
           out.clone = structuredClone({ d: new Map([[1, 2]]) }).d.get(1);
           out.console = console.log("quiet") === undefined;
+          out.process = typeof process;
+          out.buffer = typeof Buffer;
+          try { await import("node:fs"); out.node = "imported"; } catch { out.node = "refused"; }
           return out;
         }`,
         "f",
@@ -432,6 +435,9 @@ describe("the isolate", () => {
         url: ["https://naru.pub/a?b=1", "1"],
         clone: 2,
         console: true,
+        process: "undefined",
+        buffer: "undefined",
+        node: "refused",
       },
     });
   });

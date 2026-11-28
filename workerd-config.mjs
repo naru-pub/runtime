@@ -65,6 +65,8 @@ export function siteDataConfig({
   sdkFiles,
   siteObjects,
   uniqueKey,
+  allow = ["public", "local"],
+  passthrough = null,
 }) {
   const disk = (path, writable) =>
     `(${[
@@ -81,9 +83,15 @@ const config :Workerd.Config = (
     (name = "sdk-files", disk = ${disk(sdkFiles, false)}),
     # Each site's SQLite database. Override with --directory-path.
     (name = "site-objects", disk = ${disk(siteObjects, true)}),
-    # R2 is public; the control plane, for requests with a token, is local.
-    (name = "network", network = (allow = ["public", "local"], tlsOptions = (trustBrowserCas = true))),
-  ],
+    # What the Worker's own fetch may reach (siteDataConfig's allow).
+    (name = "network", network = (allow = [${allow.map((c) => `"${c}"`).join(", ")}], tlsOptions = (trustBrowserCas = true))),
+${
+  passthrough === null
+    ? ""
+    : `    # The control plane, for requests with a token (PASSTHROUGH).
+    (name = "passthrough", external = (address = "${passthrough}", http = ())),
+`
+}  ],
   sockets = [
     (name = "http", address = "127.0.0.1:8787", http = (), service = "main"),
   ],
@@ -110,7 +118,7 @@ ${modules.join("\n")}
     (name = "SITE_MONTHLY_REQUESTS", text = "20000000"),
     # No edge cache here: each visitor's read is a local SQLite query.
     (name = "EDGE_CACHE", text = "off"),
-${bindings.join("\n")}
+${passthrough === null ? "" : `    (name = "PASSTHROUGH", service = "passthrough"),\n`}${bindings.join("\n")}
   ],
   durableObjectNamespaces = [
     (className = "SiteData", uniqueKey = "${uniqueKey}", enableSql = true),

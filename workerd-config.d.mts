@@ -11,4 +11,6 @@ export function siteDataConfig(options: {
   sdkFiles: string | null;
   siteObjects: string | null;
   uniqueKey: string;
+  allow?: string[];
+  passthrough?: string | null;
 }): string;
