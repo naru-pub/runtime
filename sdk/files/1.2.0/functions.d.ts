@@ -63,8 +63,9 @@ export interface SqlResult<Row> {
  * `sql`. Anyone may call one, signed in or not, so its code decides what
  * each caller may see. A query's `sql` only reads. A call runs in one
  * transaction, for at most 50 ms of CPU and 2 seconds in all, in a release's
- * 64 MiB heap, makes at most 100 database operations, reads at most 500,000
- * rows in all, and returns at most 1 MiB of JSON. Every method's promise must
+ * 64 MiB heap, makes at most 1,000 database operations taking at most 200 ms
+ * in all, reads at most 2,000,000 rows in all, and returns at most 1 MiB of
+ * JSON. Every method's promise must
  * be used (awaited, returned or chained), or the call fails.
  */
 export interface QueryCtx {
@@ -97,7 +98,7 @@ export interface QueryCtx {
    * SQLite works on one step of it for 3 seconds; one stopped 3 times within
    * a minute is paused for 5 minutes. It binds at most 100 values, returns at most 1,000 rows and 1 MiB, BLOB columns as
    * Uint8Arrays, and counts as one database operation; a call's statements
-   * read at most 500,000 rows. A value a UNIQUE column already holds fails
+   * read at most 2,000,000 rows. A value a UNIQUE column already holds fails
    * the call with CONFLICT, `details.unique` naming the column; any other
    * mistake SQLite refuses, with its message.
    *

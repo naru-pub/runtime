@@ -456,9 +456,9 @@ export async function edit(ctx, { id, text, password }) {
 }
 ```
 
-**Limits.** A call may make 100 database operations (each `ctx.sql`
-statement, writes included) and three password hashes or checks, read at most
-500,000 rows in all, run for 50 ms of CPU and 2 seconds in all, in the
+**Limits.** A call may make 1,000 database operations (each `ctx.sql`
+statement, writes included) taking 200 ms of the database's time in all, and
+three password hashes or checks, read at most 2,000,000 rows in all, run for 50 ms of CPU and 2 seconds in all, in the
 release's 64 MiB of memory, and return at most 1 MiB of JSON. A module's
 top-level code has the same 50 ms when the release loads. Queries are limited as
 reads are: 600 a minute per member, or per address for visitors. A member may
@@ -473,16 +473,19 @@ the site's export.
 slow statement is stopped instead. Each `ctx.sql` statement is held to these
 limits:
 
-| Limit                  | Value                                      |
-| ---------------------- | ------------------------------------------ |
-| Bound values           | 100 per statement                          |
-| Rows and size returned | 1,000 rows and 1 MiB per statement         |
-| Rows read              | 500,000 per call, all statements together  |
-| Statement time         | 3 seconds for any one step of a statement  |
-| Stopped statements     | 3 stops in a minute pause it for 5 minutes |
+| Limit                  | Value                                       |
+| ---------------------- | ------------------------------------------- |
+| Bound values           | 100 per statement                           |
+| Rows and size returned | 1,000 rows and 1 MiB per statement          |
+| Rows read              | 2,000,000 per call, all statements together |
+| Database time          | 200 ms per call, all operations together    |
+| Statement time         | 3 seconds for any one step of a statement   |
+| Stopped statements     | 3 stops in a minute pause it for 5 minutes  |
 
 SQLite's rows read are counted when each statement finishes; the call fails
-after the statement that went past 500,000. Naru's runtime stops a statement
+after the statement that went past 2,000,000, and, with "Function failed:
+its database work ran too long.", after the operation that took the call's
+operations past 200 ms. Naru's runtime stops a statement
 once SQLite has worked on it for 3 seconds without handing back a row (one
 `sqlite3_step`; a statement returning many rows quickly is not stopped): the
 call fails with 400 `INVALID_REQUEST`, "This statement ran longer than 3

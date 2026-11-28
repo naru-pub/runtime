@@ -382,11 +382,12 @@ export function bindings(values: unknown): SqlValue[] {
 export const MAX_ROWS = 1000;
 export const MAX_ROW_BYTES = 1024 * 1024;
 /**
- * Rows a call's statements may read in all: five passes over a full table.
+ * Rows a call's statements may read in all: about 200 ms of a simple scan,
+ * as MAX_OBJECT_MS is, but the same verdict for the same call every time.
  * Counted from each statement's cursor once it has finished (site.ts), so it
  * fails the call after the statement that passes it, never part way.
  */
-export const MAX_ROWS_READ = 500_000;
+export const MAX_ROWS_READ = 2_000_000;
 
 /**
  * The mini's step budget, in ms, as the object's environment gives it

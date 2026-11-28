@@ -15,7 +15,8 @@ import type { HarnessCall } from "./functions.harness";
 const naru = process.env.NARU_WORKERD_BIN;
 // functions.ts's limits (it imports cloudflare:workers, which Node has not).
 const CALL_TIME_MS = 2000;
-const MAX_OPERATIONS = 100;
+const MAX_OPERATIONS = 1000;
+const MAX_OBJECT_MS = 200;
 const MAX_PASSWORD_OPERATIONS = 3;
 let dir: string;
 let worker: ChildProcess;
@@ -397,6 +398,27 @@ describe("ctx", () => {
         "f",
       ),
     ).toMatchObject({ result: ["hash:pw", true] });
+  });
+
+  test(`a call's operations take at most ${MAX_OBJECT_MS} ms of the object's time in all`, async () => {
+    const object = fresh();
+    // Each statement some tens of ms on the object, few of them: the count
+    // is far from its cap, the time is not.
+    const slow = await call(
+      `export async function f(ctx) {
+        await ctx.sql("INSERT INTO wallets (id, balance) VALUES ('kept', 1)");
+        for (;;) await ctx.sql("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 300000) SELECT count(*) AS n FROM c");
+      }`,
+      "f",
+      { object },
+    );
+    expect(slow).toMatchObject({
+      ok: false,
+      message: "Function failed: its database work ran too long.",
+    });
+    expect(slow.operations.length).toBeLessThan(50);
+    // It rolled back.
+    expect(await wallets(object)).toEqual([]);
   });
 
   test("ctx is frozen", async () => {

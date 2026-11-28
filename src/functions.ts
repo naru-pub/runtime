@@ -23,17 +23,25 @@ import {
 //   code. npm's workerd (naru-dev, the tests) enforces neither.
 // - wall time, here: CALL_TIME_MS, after which the call fails and its ctx
 //   answers nothing more, whatever the isolate is still doing;
-// - operations, here: each ctx operation is the object's time, which the
-//   isolate's CPU limit does not see.
+// - the object's time, here: each ctx operation runs on the object, which
+//   the isolate's CPU limit does not see. MAX_OBJECT_MS bounds their total,
+//   and MAX_OPERATIONS their number, against loops of near-free ones.
 
 /** A call's time from start to answer, its ctx operations included. */
 export const CALL_TIME_MS = 2000;
 /**
- * Database operations a call may make, writes included. Host time is what
- * the cap bounds: each is the object's time, which the isolate's CPU limit
- * does not count.
+ * The object's time a call's ctx operations may take in all, in ms: what
+ * its statements cost, which a count of them cannot say (100 indexed lookups
+ * take about 2 ms, three table scans can take 150). Checked after each
+ * operation, so one statement may pass it; the runtime's step budget bounds
+ * that one.
  */
-export const MAX_OPERATIONS = 100;
+export const MAX_OBJECT_MS = 200;
+/**
+ * Database operations a call may make, writes included: a guard against
+ * runaway loops of near-free ones, whose RPCs MAX_OBJECT_MS does not see.
+ */
+export const MAX_OPERATIONS = 1000;
 /** What a call may return, as JSON: a page of rows (sql.ts's MAX_ROW_BYTES). */
 export const MAX_RESULT_BYTES = 1024 * 1024;
 export const MAX_FAILURE_DETAILS_BYTES = 4 * 1024;
@@ -275,6 +283,8 @@ type CallState = {
   readonly: boolean;
   operations: number;
   passwords: number;
+  /** The object's time in the call's operations so far, in ms. */
+  objectMs: number;
   /** The first failed operation, which fails the call even if caught. */
   error?: DataError;
   /** Set when the call has answered: later operations are refused. */
@@ -318,10 +328,16 @@ export class CallHost extends RpcTarget {
       if (++state.operations > MAX_OPERATIONS)
         throw failed(`more than ${MAX_OPERATIONS} database operations.`);
       // Whether site SQL may write is the call's to say, not the code's.
+      // workerd's clock advances while a statement runs, which Cloudflare's
+      // would not: this runtime runs on Naru's own servers.
+      const started = performance.now();
       const value = state.host(
         name,
         name === "sql" ? [args[0], args[1], state.readonly] : args,
       );
+      state.objectMs += performance.now() - started;
+      if (state.objectMs > MAX_OBJECT_MS)
+        throw failed("its database work ran too long.");
       return {
         value: value === undefined ? null : value,
         next: new CallHost(state),
@@ -407,6 +423,7 @@ export async function runFunction(
     readonly: invocation.readonly === true,
     operations: 0,
     passwords: 0,
+    objectMs: 0,
     closed: false,
   };
   const { readonly: _readonly, ...call } = invocation;
