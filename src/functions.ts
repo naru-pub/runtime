@@ -110,6 +110,27 @@ export interface WorkerCode {
 const failed = (message: string) =>
   new DataError(400, `Function failed: ${message}`);
 
+/**
+ * A limit inside a call that stopped it, counted per site and hour as
+ * `tripped:<limit>` (site.ts), so a limit can be judged by whom it stops.
+ */
+export type CallTrip =
+  | "operations"
+  | "object_time"
+  | "call_rows"
+  | "call_time"
+  | "cpu"
+  | "memory"
+  | "statement";
+export const tripOf = new WeakMap<DataError, CallTrip>();
+export const tripped = <E extends DataError>(trip: CallTrip, error: E) => {
+  tripOf.set(error, trip);
+  return error;
+};
+
+/** What a call took, as runFunction measures it, for the site's hours. */
+export type CallFigures = { operations: number; objectMs: number };
+
 /** The module Naru adds to a release's isolate, as its entry. */
 export const ENTRY_MODULE = "_naru_entry.js";
 /**
@@ -326,7 +347,10 @@ export class CallHost extends RpcTarget {
           `more than ${MAX_PASSWORD_OPERATIONS} password operations.`,
         );
       if (++state.operations > MAX_OPERATIONS)
-        throw failed(`more than ${MAX_OPERATIONS} database operations.`);
+        throw tripped(
+          "operations",
+          failed(`more than ${MAX_OPERATIONS} database operations.`),
+        );
       // Whether site SQL may write is the call's to say, not the code's.
       // workerd's clock advances while a statement runs, which Cloudflare's
       // would not: this runtime runs on Naru's own servers.
@@ -337,7 +361,7 @@ export class CallHost extends RpcTarget {
       );
       state.objectMs += performance.now() - started;
       if (state.objectMs > MAX_OBJECT_MS)
-        throw failed("its database work ran too long.");
+        throw tripped("object_time", failed("its database work ran too long."));
       return {
         value: value === undefined ? null : value,
         next: new CallHost(state),
@@ -395,9 +419,10 @@ function siteFailure(args: unknown[]): DataError {
 /** What the runtime's own stopping of a call says, as the code's failure. */
 function runtimeFailure(error: unknown): DataError | undefined {
   const text = String((error as Error)?.message ?? error);
-  if (/exceeded CPU time limit/i.test(text)) return failed("it ran too long.");
+  if (/exceeded CPU time limit/i.test(text))
+    return tripped("cpu", failed("it ran too long."));
   if (/exceeded memory limit|out of memory/i.test(text))
-    return failed("it used too much memory.");
+    return tripped("memory", failed("it used too much memory."));
   if (/never generate a response|will never (resolve|complete)/i.test(text))
     return failed("it awaited something other than ctx, which never settles.");
   const start = /Failed to start Worker:\s*([\s\S]*)/.exec(text);
@@ -411,11 +436,14 @@ function runtimeFailure(error: unknown): DataError | undefined {
  * Throws a DataError: the host's own when a ctx operation failed, otherwise
  * a 400 describing the function's failure or limit. Anything else is the
  * runtime's own failure. The caller runs this inside the call's transaction.
+ * `figures`, if given, gets what the call's operations took, however it
+ * ended.
  */
 export async function runFunction(
   code: SiteCode,
   invocation: Invocation,
   host: Host,
+  figures?: CallFigures,
 ): Promise<unknown> {
   const state: CallState = {
     host,
@@ -434,7 +462,7 @@ export async function runFunction(
       code.run({ ...call, args: invocation.args ?? null }, new CallHost(state)),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(failed("it ran too long.")),
+          () => reject(tripped("call_time", failed("it ran too long."))),
           CALL_TIME_MS,
         );
       }),
@@ -448,6 +476,10 @@ export async function runFunction(
   } finally {
     clearTimeout(timer);
     state.closed = true;
+    if (figures) {
+      figures.operations = state.operations;
+      figures.objectMs = state.objectMs;
+    }
   }
   if (state.error) throw state.error;
   if ("missing" in answer)

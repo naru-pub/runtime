@@ -31,6 +31,10 @@ import {
 } from "./site-functions/restore-points";
 import {
   runFunction,
+  tripOf,
+  tripped,
+  type CallFigures,
+  type CallTrip,
   workerCode,
   type Host,
   type Loader,
@@ -314,6 +318,20 @@ const HOUR_MS = 3_600_000;
 /** Refusals' stats are written at most this often (noteLimited). */
 const LIMITED_SAVE_MS = 60_000;
 /**
+ * What each call of site code took, counted in its hour (noteCall) as
+ * `call:<figure>:<bound>`, the calls at or under each bound (`over` past the
+ * last), and `call:<figure>:max`: enough to read percentiles per site and
+ * hour, for choosing the limits (docs/todo/site-code-limits.md). Kept for
+ * the operators; the owner's page leaves them out.
+ */
+const CALL_BUCKETS = {
+  ms: [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+  object_ms: [1, 2, 5, 10, 20, 50, 100, 200],
+  operations: [1, 3, 10, 30, 100, 300, 1000],
+  rows: [10, 100, 1000, 10_000, 100_000, 1_000_000, 2_000_000],
+} as const;
+type CallFigure = keyof typeof CALL_BUCKETS;
+/**
  * Mutations a member may make a minute: enough for a page that saves as it
  * goes (a file in parts, a game's moves). What keeps a site from slowing the
  * others is its rows a minute, which every call counts against.
@@ -482,8 +500,24 @@ export class SiteData extends DurableObject<SiteDataEnv> {
       now - HOURS_KEPT,
     );
   }
-  /** The kept hours with requests, for the owner's /database. */
-  private hourly(): HourlyUsage {
+  /** Counts what a call took in its hour (CALL_BUCKETS). */
+  private noteCall(figures: Record<CallFigure, number>) {
+    const counts = this.hour(Math.floor(Date.now() / HOUR_MS));
+    for (const figure of Object.keys(CALL_BUCKETS) as CallFigure[]) {
+      const value = figures[figure];
+      const bound = CALL_BUCKETS[figure].find((b) => value <= b) ?? "over";
+      const key = `call:${figure}:${bound}`;
+      counts[key] = (counts[key] ?? 0) + 1;
+      const max = `call:${figure}:max`;
+      if (value > (counts[max] ?? 0)) counts[max] = value;
+    }
+  }
+
+  /**
+   * The kept hours with requests: for the owner's /database, without what
+   * calls took (`call:`), which `calls` (the operators') keeps.
+   */
+  private hourly(calls = false): HourlyUsage {
     this.foldMinute(this.worked);
     const now = Math.floor(Date.now() / HOUR_MS);
     const hours = new Map<number, Record<string, number>>();
@@ -502,7 +536,11 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         .sort(([a], [b]) => a - b)
         .map(([hour, counts]) => ({
           hour: hour * HOUR_MS,
-          counts: { ...counts },
+          counts: calls
+            ? { ...counts }
+            : Object.fromEntries(
+                Object.entries(counts).filter(([kind]) => !kind.startsWith("call:")),
+              ),
         })),
     };
   }
@@ -516,7 +554,18 @@ export class SiteData extends DurableObject<SiteDataEnv> {
    */
   private limitedSavedAt = 0;
   private noteLimited(limit: Limit) {
-    this.tally(`limited:${limit}`);
+    this.noteRefusal(`limited:${limit}`);
+  }
+  /**
+   * Counts a call stopped by a limit inside it (functions.ts CallTrip) as
+   * `tripped:<limit>`, written as refusals are. Every caller's, the owner's
+   * too: it says what the limit stops, not what the site's traffic meets.
+   */
+  private noteTripped(trip: CallTrip) {
+    this.noteRefusal(`tripped:${trip}`);
+  }
+  private noteRefusal(kind: string) {
+    this.tally(kind);
     const now = Date.now();
     if (now - this.limitedSavedAt < LIMITED_SAVE_MS) return;
     this.limitedSavedAt = now;
@@ -959,6 +1008,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
   private failure(error: DataError): Outcome<never> {
     const limit = limitOf.get(error);
     if (limit) this.noteLimited(limit);
+    const trip = tripOf.get(error);
+    if (trip) this.noteTripped(trip);
     return {
       ok: false,
       error: {
@@ -1783,7 +1834,8 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           statement,
           text: text.slice(0, TRIP_TEXT_CHARS),
         });
-      throw sqlFailure(error, statementBudget(this.env));
+      const failure = sqlFailure(error, statementBudget(this.env));
+      throw interrupted(error) ? tripped("statement", failure) : failure;
     } finally {
       // Into the site's rows: a member's or visitor's call is metered
       // (rows per minute, and the month's `rows`), failed statements too.
@@ -1792,9 +1844,12 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     // A call reads a bounded number of rows, all its statements together.
     budget.rowsRead += cursor.rowsRead;
     if (budget.rowsRead > MAX_ROWS_READ)
-      throw new DataError(
-        400,
-        `A call reads at most ${MAX_ROWS_READ.toLocaleString("en")} rows; read less, or by an index.`,
+      throw tripped(
+        "call_rows",
+        new DataError(
+          400,
+          `A call reads at most ${MAX_ROWS_READ.toLocaleString("en")} rows; read less, or by an index.`,
+        ),
       );
     if (kind === "write") this.checkDatabaseSize();
     return { rows, changes: kind === "write" ? cursor.rowsWritten : 0 };
@@ -2090,7 +2145,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
 
   /** The kept hours, as the owner's listing has them (`hourly`), for the operators. */
   async hourlyUsage(): Promise<Outcome<HourlyUsage>> {
-    return this.run(() => this.hourly());
+    return this.run(() => this.hourly(true));
   }
 
   /** The site's own tables and views with their columns, for naru-dev's types. */
@@ -2373,6 +2428,9 @@ export class SiteData extends DurableObject<SiteDataEnv> {
     // A live refresh is metered too, though never refused for its rows:
     // the write that caused it was admitted.
     const counted = visitor || input.member !== null;
+    const figures: CallFigures = { operations: 0, objectMs: 0 };
+    const rowsBefore = this.rowsRead;
+    const started = performance.now();
     const run = () =>
       runFunction(
         code,
@@ -2393,6 +2451,7 @@ export class SiteData extends DurableObject<SiteDataEnv> {
           file: input.file,
           name: input.name,
         }),
+        figures,
       );
     let outcome: Outcome<{ result: unknown; tables?: string[] }>;
     try {
@@ -2412,6 +2471,12 @@ export class SiteData extends DurableObject<SiteDataEnv> {
         },
       };
     }
+    this.noteCall({
+      ms: performance.now() - started,
+      object_ms: figures.objectMs,
+      operations: figures.operations,
+      rows: this.rowsRead - rowsBefore,
+    });
     if (outcome.ok && tables.written.size) this.scheduleRefresh(tables.written);
     return outcome;
   }
